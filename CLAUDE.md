@@ -12,10 +12,10 @@ All code lives in `binance/`:
 
 ## Setup
 
-Dependencies are `binance-connector` (Binance Spot API) and `requests` (Slack calls). Install them with:
+Dependencies are pinned in `requirements.txt`. Install them with:
 
 ```
-pip install binance-connector requests
+pip install -r requirements.txt
 ```
 
 A `binance/config.py` module is required at runtime but is not checked into the repo (it's gitignored). It must define:

@@ -17,9 +17,9 @@
    ```
    python -m venv .viper
    ```
-   Activate it, then install the dependency:
+   Activate it, then install dependencies:
    ```
-   pip install binance-futures-connector
+   pip install -r requirements.txt
    ```
 3. Recreate `futures/config.py` manually — it's gitignored and does **not** come through git. It needs:
    ```python
