@@ -26,3 +26,18 @@ def place_limit_order(symbol: str, side: str, quantity: float, price: float, tim
         quantity=quantity,
         price=price,
     )
+
+
+def place_limit_order_test(symbol: str, side: str, quantity: float, price: float, time_in_force: str = "GTC") -> dict:
+    """
+    Validates a LIMIT order's parameters and signature without sending it
+    to the matching engine or affecting the account.
+    """
+    return client.new_order_test(
+        symbol=symbol,
+        side=side,
+        type="LIMIT",
+        timeInForce=time_in_force,
+        quantity=quantity,
+        price=price,
+    )
