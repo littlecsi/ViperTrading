@@ -1,9 +1,21 @@
-.vscode
+# Virtual environment
 .viper
-*.xlsx
-.DS_Store
-*.png
+
+# API credentials
 config.py
+
+# Python
+__pycache__/
 *.pyc
+
+# Editor / OS
+.vscode
+.DS_Store
+
+# Local scratch / test scripts
+test.py
+
+# Misc
+*.xlsx
+*.png
 *.pem
-binance/test.py
