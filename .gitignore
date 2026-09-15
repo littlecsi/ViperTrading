@@ -1,5 +1,5 @@
 .vscode
-.xlsx
+.viper
 *.xlsx
 .DS_Store
 *.png
@@ -7,4 +7,3 @@ config.py
 *.pyc
 *.pem
 binance/test.py
-slack/test.py
