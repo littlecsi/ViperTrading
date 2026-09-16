@@ -21,18 +21,24 @@ The active system lives in `futures/`:
 - `futures/client.py` — `build(testnet)` constructs the Binance `UMFutures` client; also measures the
   offset between this machine's clock and Binance's server clock at startup and patches
   `binance.api.get_timestamp` with it.
-- `futures/market.py` — exchange reads: mark price, signed position amount, wallet balance, available
-  balance, unrealized PnL, symbol filters (lot step, min qty, min notional), and setting leverage.
+- `futures/market.py` — exchange reads: `get_snapshot()` returns a frozen `Snapshot` (mark price,
+  signed position amount, unrealized PnL, wallet balance, available balance) from one call per
+  endpoint, built out of pure extractors (`wallet_balance_from`, `available_balance_from`,
+  `position_amt_from`, `unrealized_pnl_from`) that take an already-fetched payload. Also
+  `get_position_amt()` for a one-symbol read outside the tick snapshot, `get_filters()` (lot step, min
+  qty, min notional), and `set_leverage()`.
 - `futures/strategy.py` — pure decision logic. `decide()` takes plain values and returns a `Decision`;
   see architecture notes for why this module has no I/O.
 - `futures/execution.py` — quantity flooring to the lot step, exchange filter checks, and market-order
   placement.
 - `futures/journal.py` — two JSONL logs under `futures/logs/` (gitignored): `ticks-YYYY-MM-DD.jsonl`
-  (one line per loop iteration, including no-ops) and `orders-YYYY-MM-DD.jsonl` (one line per executed
-  order, carrying a full environment snapshot at fill time).
-- `futures/bot.py` — the polling loop (entry point). Owns only two pieces of mutable state across
-  iterations: `active_index` (which zone is currently being worked) and `halted` (whether the
-  HALT-left-the-ladder notice has already been printed).
+  (one line per loop iteration where something happened; uneventful ones are throttled — see
+  architecture notes below) and `orders-YYYY-MM-DD.jsonl` (one line per executed order, carrying a full
+  environment snapshot at fill time).
+- `futures/bot.py` — the polling loop (entry point). Owns only three pieces of mutable state across
+  iterations: `active_index` (which zone is currently being worked), `halted` (whether the
+  HALT-left-the-ladder notice has already been printed), and `last_tick_log_at` (when the tick journal
+  last wrote, for the throttle).
 
 `binance/` (`binance/main.py`, `binance/biat.py`) is the **legacy Spot bot** — a volatility-breakout
 strategy for Spot XRP/USDT with Slack alerting. It is retained for reference but is **out of scope and
@@ -85,11 +91,27 @@ collection.
   will later replace the hand-written rules, and it is what makes the module exhaustively unit-testable
   without touching an exchange. Do not add a client argument, a network call, or a `datetime.now()` to
   this module; push any such need to `bot.py` and pass the result in as a value.
-- **Sizing uses TOTAL wallet balance (`market.get_wallet_balance`), never available balance
-  (`market.get_available_balance`).** Available balance shrinks as margin is consumed by an open
-  position, which would shrink the computed target notional as the position fills and stall
-  accumulation short of its intended size. `get_available_balance` exists and is logged for visibility,
-  but must not feed `max_notional`.
+- **Sizing uses TOTAL wallet balance (`Snapshot.wallet_balance`, from `market.wallet_balance_from`,
+  which reads the payload's `balance` field), never available balance (`Snapshot.available_balance`,
+  from `market.available_balance_from`, which reads `availableBalance`).** Available balance shrinks as
+  margin is consumed by an open position, which would shrink the computed target notional as the
+  position fills and stall accumulation short of its intended size. `available_balance` exists and is
+  logged for visibility, but must not feed `max_notional`.
+- **One REST call per endpoint per tick** (`market.get_snapshot`: `ticker_price`,
+  `get_position_risk`, `balance` — 3 calls, 11 request weight). Every value the tick needs is derived
+  from those three payloads by the pure extractors; do not add a second fetch of an endpoint the
+  snapshot already read. At `poll_seconds: 1` the earlier five-call tick cost 21 weight, 1260/min
+  against Binance's 2400/min limit, and being rate limited means an IP ban while holding a leveraged
+  position the bot then cannot flatten. It also keeps the tick an actual snapshot: price, position, and
+  balance are read at one instant instead of five, so they cannot disagree with each other.
+- **The tick journal throttles only uneventful ticks** (`bot.TICK_LOG_INTERVAL_SECONDS`, with
+  `_should_log_tick` and the loop's `last_tick_log_at`). `HOLD`/`IDLE` ticks are written at most once
+  per 60 seconds of elapsed `time.monotonic()` — elapsed time, not a tick count, so the rate survives a
+  change to `poll_seconds`. Everything else is always written: `BUY`/`SELL`/`HALT` ticks and the
+  `config_error`, `config_refused`, `startup_refused`, and `error` records. Never turn this into
+  "write one tick in sixty" — the tick journal is the audit trail and the dataset a PPO policy will
+  train on, so blanket sampling would discard precisely the interesting events. Order-journal
+  behaviour is unconditional: every executed order writes a record.
 - **Order quantities floor to the lot step, never round up** (`execution.quantity_for` uses
   `math.floor`). Rounding up would let the bot exceed its own exposure cap on the last partial step of a
   fill — flooring is the only direction that cannot overshoot.
@@ -115,6 +137,6 @@ collection.
   ahead of Binance's server clock, and Binance rejects a signed request whose timestamp is in the
   future with error -1021; the offset is measured once at startup against a public endpoint and applied
   to every subsequent timestamp.
-- `bot.py` holds only `active_index` and `halted` as mutable loop state; `market.py`, `strategy.py`,
-  `execution.py`, and `journal.py` are stateless and take all inputs as arguments — don't reintroduce
-  module-level mutable state into them.
+- `bot.py` holds only `active_index`, `halted`, and `last_tick_log_at` as mutable loop state;
+  `market.py`, `strategy.py`, `execution.py`, and `journal.py` are stateless and take all inputs as
+  arguments — don't reintroduce module-level mutable state into them.
