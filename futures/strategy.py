@@ -25,3 +25,41 @@ def target_notional(d: float, max_n: float, alpha: float) -> float:
 
 def signed(target: float, trend: str) -> float:
     return target if trend == LONG else -target
+
+
+def select_zone(
+    price: float,
+    zones: tuple[Zone, ...],
+    active_index: int | None,
+    stop_buffer: float,
+) -> int | None:
+    """Index of the zone the bot should work, or None if price is off the ladder.
+
+    An already-active zone is retained until price leaves it by stop_buffer.
+    This dead band matters because contiguous zones share a boundary: without
+    it, price hovering on that boundary would flip the target between maximum
+    and flat on every tick."""
+    if active_index is not None and 0 <= active_index < len(zones):
+        z = zones[active_index]
+        if z.support * (1 - stop_buffer) <= price <= z.resistance * (1 + stop_buffer):
+            return active_index
+
+    for i, z in enumerate(zones):
+        if z.support <= price <= z.resistance:
+            return i
+
+    return None
+
+
+def past_adverse_end(
+    price: float,
+    zones: tuple[Zone, ...],
+    trend: str,
+    stop_buffer: float,
+) -> bool:
+    """True when price has left the ladder in the direction that invalidates
+    the operator's thesis entirely — below every support when long, above
+    every resistance when short."""
+    if trend == LONG:
+        return price < min(z.support for z in zones) * (1 - stop_buffer)
+    return price > max(z.resistance for z in zones) * (1 + stop_buffer)
