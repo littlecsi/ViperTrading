@@ -6,7 +6,7 @@
   "exposure_fraction": 1.0,
   "rebalance_threshold": 0.05,
   "stop_buffer": 0.01,
-  "poll_seconds": 5,
+  "poll_seconds": 1,
   "testnet": true,
   "zones": [
     { "support": 2625.00, "resistance": 3284.04 },
