@@ -21,7 +21,33 @@ def is_executable(qty: float, price: float, filters: Filters) -> bool:
     return qty * price >= filters.min_notional
 
 
-def execute(client, symbol: str, side: str, qty: float) -> dict:
-    """Send a market order. Raises on failure — a rejected order must surface
-    rather than be silently swallowed."""
-    return client.new_order(symbol=symbol, side=side, type="MARKET", quantity=qty)
+def execute(
+    client,
+    symbol: str,
+    side: str,
+    qty: float,
+    reduce_only: bool = False,
+) -> dict:
+    """Send a market order. Raises on failure - a rejected order must surface
+    rather than be silently swallowed.
+
+    newOrderRespType="RESULT" is what makes the order journal able to
+    reconstruct realised PnL: the default "ACK" response carries no avgPrice or
+    executedQty, so the fill data would have to be re-fetched or guessed from
+    the pre-trade mark price.
+
+    reduce_only marks an order that may only shrink the position. Flattening
+    orders are sized from a position read earlier in the tick; if that position
+    shrank in between, a plain market order would overshoot and open a position
+    in the opposite direction. Note the exchange REJECTS a reduceOnly order
+    when there is nothing to reduce, so only set it against a live position."""
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "MARKET",
+        "quantity": qty,
+        "newOrderRespType": "RESULT",
+    }
+    if reduce_only:
+        params["reduceOnly"] = "true"
+    return client.new_order(**params)

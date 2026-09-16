@@ -36,18 +36,45 @@ def test_is_executable_accepts_valid_order():
     assert execution.is_executable(0.041, 2403.0, F) is True
 
 
+class FakeClient:
+    def __init__(self):
+        self.orders = []
+
+    def new_order(self, **kwargs):
+        self.orders.append(kwargs)
+        return {"orderId": 1, "status": "FILLED", **kwargs}
+
+
 def test_execute_sends_market_order():
-    class FakeClient:
-        def __init__(self):
-            self.orders = []
-
-        def new_order(self, **kwargs):
-            self.orders.append(kwargs)
-            return {"orderId": 1, "status": "FILLED", **kwargs}
-
     c = FakeClient()
     result = execution.execute(c, "ETHUSDT", "BUY", 0.041)
     assert c.orders == [
-        {"symbol": "ETHUSDT", "side": "BUY", "type": "MARKET", "quantity": 0.041}
+        {
+            "symbol": "ETHUSDT",
+            "side": "BUY",
+            "type": "MARKET",
+            "quantity": 0.041,
+            "newOrderRespType": "RESULT",
+        }
     ]
     assert result["orderId"] == 1
+
+
+def test_execute_requests_fill_details_in_response():
+    # "ACK" (the connector default) carries no avgPrice/executedQty, which is
+    # why the order journal could not reconstruct realised PnL.
+    c = FakeClient()
+    execution.execute(c, "ETHUSDT", "BUY", 0.041)
+    assert c.orders[0]["newOrderRespType"] == "RESULT"
+
+
+def test_execute_omits_reduce_only_by_default():
+    c = FakeClient()
+    execution.execute(c, "ETHUSDT", "BUY", 0.041)
+    assert "reduceOnly" not in c.orders[0]
+
+
+def test_execute_sets_reduce_only_when_requested():
+    c = FakeClient()
+    execution.execute(c, "ETHUSDT", "SELL", 0.041, reduce_only=True)
+    assert c.orders[0]["reduceOnly"] == "true"

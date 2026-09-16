@@ -34,6 +34,16 @@ def _sleep(seconds) -> None:
     time.sleep(delay)
 
 
+def _opt_float(value) -> float | None:
+    """Parse an optional numeric field from an exchange response. Returns None
+    when the field is absent or unparseable, so the journal records a known
+    gap instead of a fabricated zero."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def run() -> None:
     cfg = settings.load()
     api = client.build(cfg.testnet)
@@ -234,7 +244,17 @@ def run() -> None:
                 continue
 
             side = "BUY" if decision.delta > 0 else "SELL"
-            result = execution.execute(api, cfg.symbol, side, qty)
+            # Flattening orders are sized from the position read at the top of
+            # this tick. If it shrank since (partial ADL, manual intervention,
+            # another process), a plain market order overshoots and opens the
+            # opposite position - a naked short on the very path where the bot
+            # decided its long thesis was dead. reduceOnly is rejected when
+            # there is nothing to reduce, hence the position check.
+            reduce_only = (
+                decision.reason in (strategy.STOP_OUT, strategy.HALT_FLATTEN)
+                and position_notional != 0
+            )
+            result = execution.execute(api, cfg.symbol, side, qty, reduce_only=reduce_only)
 
             # The order is live on the exchange from here. Everything below is
             # bookkeeping, and a failure in it must not lose the fill record or
@@ -247,6 +267,22 @@ def run() -> None:
                     position_after = None
                     journal.log_tick({"action": "error", "error": f"position_after failed: {exc}"})
 
+                # Realised PnL has to be reconstructable from this record, so
+                # the fill is recorded as it happened rather than as it was
+                # estimated: fill_price/executed_qty come from the RESULT
+                # response, mark_price stays as the pre-trade reference, and
+                # notional is None rather than a pre-trade guess if the
+                # exchange returned no fill data. Commission needs a separate
+                # userTrades call that this loop deliberately does not make;
+                # the fields are present and null so the gap is explicit.
+                fill_price = _opt_float(result.get("avgPrice")) or None
+                executed_qty = _opt_float(result.get("executedQty")) or None
+                fill_notional = (
+                    fill_price * executed_qty
+                    if fill_price is not None and executed_qty is not None
+                    else None
+                )
+
                 journal.log_order(
                     {
                         "order_id": result.get("orderId"),
@@ -255,7 +291,12 @@ def run() -> None:
                         "side": side,
                         "reason": decision.reason,
                         "quantity": qty,
-                        "notional": qty * price,
+                        "executed_qty": executed_qty,
+                        "fill_price": fill_price,
+                        "notional": fill_notional,
+                        "commission": None,
+                        "commission_asset": None,
+                        "reduce_only": reduce_only,
                         "mark_price": price,
                         "trend": cfg.trend,
                         "leverage": cfg.leverage,
