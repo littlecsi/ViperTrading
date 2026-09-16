@@ -17,7 +17,7 @@ def run() -> None:
     filters = market.get_filters(api, cfg.symbol)
 
     label = "TESTNET" if cfg.testnet else "LIVE"
-    print(f"Viper starting on {label} — {cfg.symbol} @ {cfg.leverage}x, trend={cfg.trend}")
+    print(f"Viper starting on {label} - {cfg.symbol} @ {cfg.leverage}x, trend={cfg.trend}")
 
     active_index = None
     halted = False
@@ -88,7 +88,7 @@ def run() -> None:
                 continue
 
             if decision.action == strategy.HALT and not halted:
-                print(f"HALT — price {price} left the zone ladder")
+                print(f"HALT - price {price} left the zone ladder")
                 halted = True
 
             qty = execution.quantity_for(decision.delta, price, filters)
