@@ -170,6 +170,14 @@ def run() -> None:
                         halted = False
                         refused_cfg = None
                         print("settings reloaded")
+                else:
+                    # The file now matches what is running, so any earlier
+                    # refusal is spent. Without this, an operator who sets
+                    # testnet, reverts it, then sets it again gets NO message
+                    # and no journal line the second time - and that loud
+                    # message is the entire mitigation. A silent refusal reads
+                    # exactly like the hazard it exists to prevent.
+                    refused_cfg = None
             except (ValueError, KeyError, OSError) as exc:
                 journal.log_tick({"action": "config_error", "error": str(exc)})
 
@@ -238,11 +246,10 @@ def run() -> None:
             # this tick. If it shrank since (partial ADL, manual intervention,
             # another process), a plain market order overshoots and opens the
             # opposite position - a naked short on the very path where the bot
-            # decided its long thesis was dead. reduceOnly is rejected when
-            # there is nothing to reduce, hence the position check.
-            reduce_only = (
-                decision.reason in (strategy.STOP_OUT, strategy.HALT_FLATTEN)
-                and position_notional != 0
+            # decided its long thesis was dead. The gate is direction-based,
+            # not reason-based: see execution.should_reduce_only.
+            reduce_only = execution.should_reduce_only(
+                decision.reason, decision.delta, position_notional
             )
             result = execution.execute(api, cfg.symbol, side, qty, reduce_only=reduce_only)
 

@@ -2,6 +2,7 @@ import math
 from dataclasses import dataclass
 
 from market import Filters
+from strategy import HALT_FLATTEN, STOP_OUT
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,33 @@ def is_executable(qty: float, price: float, filters: Filters) -> bool:
     if qty <= 0 or qty < filters.min_qty:
         return False
     return qty * price >= filters.min_notional
+
+
+def should_reduce_only(reason, delta: float, position_notional: float) -> bool:
+    """Whether an order may be sent reduceOnly.
+
+    The tempting test - "is this a stop-out or a halt-flatten?" - is wrong, and
+    wrong in a way that wedges the bot. STOP_OUT does not mean flatten: the
+    strategy assigns it whenever the active zone changed while a position is
+    held, regardless of the new target's size. Crossing a zone boundary UPWARD
+    lands price near the new zone's support, where d approaches 1 and the
+    target approaches max_notional, so a STOP_OUT is routinely a large
+    position-INCREASING order. Tagged reduceOnly the exchange rejects it
+    (-2022), and since execute() raises before the tick updates active_index,
+    the next tick recomputes the same STOP_OUT and is rejected again: an
+    unbounded rejected-order loop, one per poll interval, with the strategy
+    permanently unable to enter the new zone.
+
+    Direction is the only sound test. A reducing order is by definition one
+    that opposes the position it is sent against, which still delivers what
+    reduceOnly was added for - an order sized against a position that has since
+    shrunk can no longer overshoot into a position on the opposite side."""
+    if reason not in (STOP_OUT, HALT_FLATTEN):
+        return False
+    if position_notional == 0:
+        # reduceOnly is rejected outright when there is nothing to reduce.
+        return False
+    return (delta > 0) != (position_notional > 0)
 
 
 def _positive(value) -> float | None:

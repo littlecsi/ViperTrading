@@ -1,6 +1,7 @@
 import pytest
 
 import execution
+import strategy
 from market import Filters
 
 F = Filters(step_size=0.001, min_qty=0.001, min_notional=20.0)
@@ -80,6 +81,44 @@ def test_execute_sets_reduce_only_when_requested():
     c = FakeClient()
     execution.execute(c, "ETHUSDT", "SELL", 0.041, reduce_only=True)
     assert c.orders[0]["reduceOnly"] == "true"
+
+
+def test_stop_out_that_reduces_the_position_is_reduce_only():
+    # Long +500 being cut to +100: the order opposes the position.
+    assert execution.should_reduce_only(strategy.STOP_OUT, -400.0, 500.0) is True
+
+
+def test_stop_out_that_increases_the_position_is_not_reduce_only():
+    # The regression this gate exists for: crossing a zone boundary upward
+    # lands price near the new zone's support, where the target approaches
+    # max_notional, so STOP_OUT arrives as a large position-INCREASING buy.
+    # Tagged reduceOnly the exchange rejects it (-2022) and, because execute()
+    # raises before active_index advances, the next tick repeats it forever.
+    assert execution.should_reduce_only(strategy.STOP_OUT, 575.0, 50.0) is False
+
+
+def test_stop_out_increasing_a_short_is_not_reduce_only():
+    assert execution.should_reduce_only(strategy.STOP_OUT, -575.0, -50.0) is False
+
+
+def test_halt_flatten_is_reduce_only_in_both_directions():
+    assert execution.should_reduce_only(strategy.HALT_FLATTEN, -500.0, 500.0) is True
+    assert execution.should_reduce_only(strategy.HALT_FLATTEN, 500.0, -500.0) is True
+
+
+def test_scale_in_is_never_reduce_only():
+    assert execution.should_reduce_only(strategy.SCALE_IN, 400.0, 100.0) is False
+
+
+def test_scale_out_is_never_reduce_only():
+    # SCALE_OUT reduces too, but reduceOnly is reserved for the flattening
+    # paths that are sized against a possibly-stale position read.
+    assert execution.should_reduce_only(strategy.SCALE_OUT, -400.0, 500.0) is False
+
+
+def test_reduce_only_requires_an_existing_position():
+    # reduceOnly is rejected outright when there is nothing to reduce.
+    assert execution.should_reduce_only(strategy.HALT_FLATTEN, -400.0, 0.0) is False
 
 
 def test_fill_from_response_reads_avg_price():
