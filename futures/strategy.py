@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 from settings import Zone, LONG, SHORT
 
 
@@ -63,3 +65,109 @@ def past_adverse_end(
     if trend == LONG:
         return price < min(z.support for z in zones) * (1 - stop_buffer)
     return price > max(z.resistance for z in zones) * (1 + stop_buffer)
+
+
+HOLD = "hold"
+BUY = "buy"
+SELL = "sell"
+HALT = "halt"
+IDLE = "idle"
+
+SCALE_IN = "scale_in"
+SCALE_OUT = "scale_out"
+STOP_OUT = "stop_out"
+HALT_FLATTEN = "halt_flatten"
+
+
+@dataclass(frozen=True)
+class Decision:
+    action: str
+    reason: str | None
+    zone_index: int | None
+    d: float | None
+    max_n: float
+    target_signed: float
+    delta: float
+
+
+def decide(
+    price: float,
+    zones: tuple[Zone, ...],
+    trend: str,
+    position_notional: float,
+    wallet_balance: float,
+    leverage: int,
+    alpha: float,
+    exposure_fraction: float,
+    stop_buffer: float,
+    rebalance_threshold: float,
+    min_notional: float,
+    active_index: int | None,
+) -> Decision:
+    """Pure decision step. Plain values in, target position out.
+
+    This is the seam a learned policy replaces: nothing here touches the
+    network, the filesystem, or the clock."""
+    max_n = max_notional(wallet_balance, leverage, exposure_fraction)
+
+    if past_adverse_end(price, zones, trend, stop_buffer):
+        return Decision(
+            action=HALT,
+            reason=HALT_FLATTEN if position_notional != 0 else None,
+            zone_index=None,
+            d=None,
+            max_n=max_n,
+            target_signed=0.0,
+            delta=-position_notional,
+        )
+
+    zone_index = select_zone(price, zones, active_index, stop_buffer)
+
+    if zone_index is None:
+        if position_notional == 0:
+            action, reason = IDLE, None
+        else:
+            action = SELL if position_notional > 0 else BUY
+            reason = SCALE_OUT
+        return Decision(
+            action=action,
+            reason=reason,
+            zone_index=None,
+            d=None,
+            max_n=max_n,
+            target_signed=0.0,
+            delta=-position_notional,
+        )
+
+    d = distance(price, zones[zone_index], trend)
+    target = signed(target_notional(d, max_n, alpha), trend)
+    delta = target - position_notional
+
+    threshold = max(rebalance_threshold * max_n, min_notional)
+    if abs(delta) < threshold:
+        return Decision(
+            action=HOLD,
+            reason=None,
+            zone_index=zone_index,
+            d=d,
+            max_n=max_n,
+            target_signed=target,
+            delta=0.0,
+        )
+
+    if active_index is not None and zone_index != active_index and position_notional != 0:
+        reason = STOP_OUT
+    elif abs(target) > abs(position_notional):
+        reason = SCALE_IN
+    else:
+        reason = SCALE_OUT
+
+    return Decision(
+        action=BUY if delta > 0 else SELL,
+        reason=reason,
+        zone_index=zone_index,
+        d=d,
+        max_n=max_n,
+        target_signed=target,
+        delta=delta,
+    )

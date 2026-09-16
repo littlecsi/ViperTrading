@@ -99,3 +99,90 @@ def test_past_adverse_end_short_above_highest_resistance():
 def test_past_adverse_end_ignores_favourable_side():
     assert strategy.past_adverse_end(9999.0, ZONES, LONG, 0.01) is False
     assert strategy.past_adverse_end(1000.0, ZONES, SHORT, 0.01) is False
+
+
+def decide(**kw):
+    base = dict(
+        price=2403.0,
+        zones=ZONES,
+        trend=LONG,
+        position_notional=0.0,
+        wallet_balance=1000.0,
+        leverage=5,
+        alpha=2.0,
+        exposure_fraction=1.0,
+        stop_buffer=0.01,
+        rebalance_threshold=0.05,
+        min_notional=20.0,
+        active_index=None,
+    )
+    base.update(kw)
+    return strategy.decide(**base)
+
+
+def test_decide_opens_position_from_flat():
+    d = decide()
+    assert d.action == strategy.BUY
+    assert d.reason == strategy.SCALE_IN
+    assert d.zone_index == 1
+    assert d.delta > 0
+    assert d.target_signed == pytest.approx(d.delta)
+
+
+def test_decide_holds_when_delta_below_threshold():
+    first = decide()
+    d = decide(position_notional=first.target_signed)
+    assert d.action == strategy.HOLD
+    assert d.delta == 0.0
+
+
+def test_decide_scales_out_when_price_rises_toward_resistance():
+    held = decide().target_signed
+    d = decide(price=2550.0, position_notional=held, active_index=1)
+    assert d.action == strategy.SELL
+    assert d.reason == strategy.SCALE_OUT
+    assert d.delta < 0
+
+
+def test_decide_flat_target_at_resistance():
+    d = decide(price=2625.0, position_notional=0.0, active_index=1)
+    assert d.target_signed == pytest.approx(0.0)
+
+
+def test_decide_max_target_at_support():
+    d = decide(price=2371.26, position_notional=0.0, active_index=1)
+    assert d.target_signed == pytest.approx(5000.0)
+
+
+def test_decide_stop_out_on_zone_change_while_holding():
+    d = decide(price=2340.0, position_notional=5000.0, active_index=1)
+    assert d.zone_index == 2
+    assert d.reason == strategy.STOP_OUT
+    assert d.action == strategy.SELL
+    assert d.delta < 0
+
+
+def test_decide_halts_below_ladder():
+    d = decide(price=1800.0, position_notional=3000.0, active_index=2)
+    assert d.action == strategy.HALT
+    assert d.reason == strategy.HALT_FLATTEN
+    assert d.target_signed == 0.0
+    assert d.delta == pytest.approx(-3000.0)
+
+
+def test_decide_idles_above_ladder_when_flat():
+    d = decide(price=9999.0, position_notional=0.0)
+    assert d.action == strategy.IDLE
+    assert d.delta == 0.0
+
+
+def test_decide_short_trend_targets_negative_notional():
+    d = decide(trend=SHORT, price=2600.0, active_index=1)
+    assert d.target_signed < 0
+    assert d.action == strategy.SELL
+
+
+def test_decide_respects_min_notional_over_threshold():
+    # tiny max_notional makes the 5% threshold smaller than min_notional
+    d = decide(wallet_balance=10.0, price=2624.0, active_index=1)
+    assert d.action == strategy.HOLD
