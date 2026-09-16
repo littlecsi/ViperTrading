@@ -19,8 +19,12 @@ The zone-scaling Futures bot is **implemented and testnet-validated**:
 - The bot has placed a **real order on Binance testnet** — a full decide -> size -> execute -> journal
   cycle has run end-to-end against the live testnet exchange, not just in tests.
 
-`futures/trading.py` (the earlier scratch trading module) and `futures/test.py` (the earlier personal
-scratch script) are both **gone** — superseded by the modules above.
+`futures/trading.py` (the earlier scratch trading module) has been deleted from the repository —
+superseded by the modules above. `futures/test.py` (the earlier personal scratch script) was never
+tracked in git — it's gitignored — so it will not appear on a fresh `git pull` or clone either. If a
+stale local copy of it is still sitting in your working tree from before this work, it now imports the
+deleted `trading` module and will error immediately if run; it's safe to delete locally, but nobody but
+you should do that, since it's your own scratch file.
 
 Old Spot-based code in `binance/` is legacy and out of scope; the Futures bot in `futures/` is the only
 active system.
