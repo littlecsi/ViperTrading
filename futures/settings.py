@@ -66,15 +66,32 @@ def load(path: str = SETTINGS_PATH) -> Settings:
     if alpha <= 0:
         raise ValueError("alpha must be positive")
 
+    # The three below are hot-reloaded into a running bot, so a typo here is a
+    # live-fire hazard rather than a startup nuisance: poll_seconds feeds
+    # time.sleep (negative raises, zero busy-loops into a rate-limit ban), and
+    # a rebalance_threshold of 0 collapses the churn guard onto the exchange
+    # min-notional floor, which bleeds fees on nearly every tick.
+    rebalance_threshold = float(data["rebalance_threshold"])
+    if not 0 < rebalance_threshold < 1:
+        raise ValueError("rebalance_threshold must be in (0, 1)")
+
+    stop_buffer = float(data["stop_buffer"])
+    if not 0 <= stop_buffer < 1:
+        raise ValueError("stop_buffer must be in [0, 1)")
+
+    poll_seconds = int(data["poll_seconds"])
+    if poll_seconds < 1:
+        raise ValueError("poll_seconds must be at least 1")
+
     return Settings(
         symbol=str(data["symbol"]),
         trend=trend,
         leverage=leverage,
         alpha=alpha,
         exposure_fraction=exposure_fraction,
-        rebalance_threshold=float(data["rebalance_threshold"]),
-        stop_buffer=float(data["stop_buffer"]),
-        poll_seconds=int(data["poll_seconds"]),
+        rebalance_threshold=rebalance_threshold,
+        stop_buffer=stop_buffer,
+        poll_seconds=poll_seconds,
         testnet=bool(data["testnet"]),
         zones=_parse_zones(data["zones"]),
     )

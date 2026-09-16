@@ -81,3 +81,52 @@ def test_rejects_exposure_fraction_out_of_range(tmp_path):
     data["exposure_fraction"] = 1.5
     with pytest.raises(ValueError, match="exposure_fraction"):
         settings.load(write(tmp_path, data))
+
+
+def test_rejects_negative_poll_seconds(tmp_path):
+    data = valid_data()
+    data["poll_seconds"] = -5
+    with pytest.raises(ValueError, match="poll_seconds"):
+        settings.load(write(tmp_path, data))
+
+
+def test_rejects_sub_second_poll_seconds(tmp_path):
+    # 0.5 truncates to 0, which would busy-loop into a rate-limit ban.
+    data = valid_data()
+    data["poll_seconds"] = 0.5
+    with pytest.raises(ValueError, match="poll_seconds"):
+        settings.load(write(tmp_path, data))
+
+
+def test_rejects_zero_rebalance_threshold(tmp_path):
+    data = valid_data()
+    data["rebalance_threshold"] = 0
+    with pytest.raises(ValueError, match="rebalance_threshold"):
+        settings.load(write(tmp_path, data))
+
+
+def test_rejects_rebalance_threshold_at_or_above_one(tmp_path):
+    data = valid_data()
+    data["rebalance_threshold"] = 1.0
+    with pytest.raises(ValueError, match="rebalance_threshold"):
+        settings.load(write(tmp_path, data))
+
+
+def test_rejects_negative_stop_buffer(tmp_path):
+    data = valid_data()
+    data["stop_buffer"] = -0.01
+    with pytest.raises(ValueError, match="stop_buffer"):
+        settings.load(write(tmp_path, data))
+
+
+def test_rejects_stop_buffer_at_or_above_one(tmp_path):
+    data = valid_data()
+    data["stop_buffer"] = 1.0
+    with pytest.raises(ValueError, match="stop_buffer"):
+        settings.load(write(tmp_path, data))
+
+
+def test_accepts_zero_stop_buffer(tmp_path):
+    data = valid_data()
+    data["stop_buffer"] = 0
+    assert settings.load(write(tmp_path, data)).stop_buffer == 0.0
