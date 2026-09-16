@@ -44,6 +44,41 @@ def run() -> None:
     label = "TESTNET" if cfg.testnet else "LIVE"
     print(f"Viper starting on {label} - {cfg.symbol} @ {cfg.leverage}x, trend={cfg.trend}")
 
+    # Startup reconciliation guard. The sizing logic assumes it owns the whole
+    # position on the configured symbol, so a pre-existing position that is
+    # larger than this bot would ever take, or is on the wrong side of the
+    # configured trend, is somebody else's trade. Reconciling it would happen
+    # silently in one market order on the first tick.
+    start_price = market.get_mark_price(api, cfg.symbol)
+    start_amt = market.get_position_amt(api, cfg.symbol)
+    start_notional = start_amt * start_price
+    start_max_n = strategy.max_notional(
+        market.get_wallet_balance(api), cfg.leverage, cfg.exposure_fraction
+    )
+    wrong_side = (cfg.trend == settings.LONG and start_notional < 0) or (
+        cfg.trend == settings.SHORT and start_notional > 0
+    )
+    if wrong_side or abs(start_notional) > start_max_n:
+        problem = "opposes trend" if wrong_side else "exceeds the exposure cap"
+        print(f"REFUSING TO START: existing {cfg.symbol} position {problem}.")
+        print(f"  position: {start_amt} ({start_notional:.2f} USDT at {start_price})")
+        print(f"  trend: {cfg.trend}, max notional this bot would hold: {start_max_n:.2f} USDT")
+        print("  Flatten or reconcile that position manually, then start the bot again.")
+        journal.log_tick(
+            {
+                "action": "startup_refused",
+                "reason": "unreconciled_position",
+                "symbol": cfg.symbol,
+                "testnet": cfg.testnet,
+                "position_amt": start_amt,
+                "current_notional": start_notional,
+                "max_notional": start_max_n,
+                "trend": cfg.trend,
+                "wrong_side": wrong_side,
+            }
+        )
+        return
+
     active_index = None
     halted = False
     # The config whose reload was last refused. Refusals are re-evaluated every
