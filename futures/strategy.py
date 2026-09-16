@@ -155,6 +155,8 @@ def decide(
             delta=0.0,
         )
 
+    # STOP_OUT takes precedence over SCALE_IN/SCALE_OUT: a zone change while
+    # holding a position is always a stop-out, regardless of target size.
     if active_index is not None and zone_index != active_index and position_notional != 0:
         reason = STOP_OUT
     elif abs(target) > abs(position_notional):

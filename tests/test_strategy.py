@@ -186,3 +186,19 @@ def test_decide_respects_min_notional_over_threshold():
     # tiny max_notional makes the 5% threshold smaller than min_notional
     d = decide(wallet_balance=10.0, price=2624.0, active_index=1)
     assert d.action == strategy.HOLD
+
+
+def test_churn_guard_uses_max_not_min_of_thresholds():
+    # target lands at ~10: above rebalance_threshold*max_n (2.5) but below
+    # min_notional (20). Only max() holds here — min() would let this
+    # sub-minimum order through, which the exchange would reject outright.
+    d = decide(wallet_balance=10.0, price=2511.53, active_index=1)
+    assert d.action == strategy.HOLD
+    assert 2.5 < abs(d.target_signed) < 20
+
+
+def test_churn_guard_trades_once_above_min_notional():
+    # target lands at ~25, clearing both floors, order goes out.
+    d = decide(wallet_balance=10.0, price=2445.58, active_index=1)
+    assert d.action == strategy.BUY
+    assert abs(d.target_signed) > 20
