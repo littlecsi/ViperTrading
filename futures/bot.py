@@ -30,8 +30,13 @@ def run() -> None:
                 new_cfg = settings.load()
                 if new_cfg != cfg:
                     if new_cfg.symbol != cfg.symbol:
-                        filters = market.get_filters(api, new_cfg.symbol)
+                        # Fetch into a temporary: if set_leverage below fails,
+                        # the previous symbol's filters stay in force.
+                        # Committing filters early would leave cfg on the old
+                        # symbol while sizing orders off the new symbol's lot step.
+                        new_filters = market.get_filters(api, new_cfg.symbol)
                         market.set_leverage(api, new_cfg.symbol, new_cfg.leverage)
+                        filters = new_filters
                     elif new_cfg.leverage != cfg.leverage:
                         market.set_leverage(api, new_cfg.symbol, new_cfg.leverage)
                     cfg = new_cfg
