@@ -29,7 +29,10 @@ def run() -> None:
             try:
                 new_cfg = settings.load()
                 if new_cfg != cfg:
-                    if new_cfg.leverage != cfg.leverage:
+                    if new_cfg.symbol != cfg.symbol:
+                        filters = market.get_filters(api, new_cfg.symbol)
+                        market.set_leverage(api, new_cfg.symbol, new_cfg.leverage)
+                    elif new_cfg.leverage != cfg.leverage:
                         market.set_leverage(api, new_cfg.symbol, new_cfg.leverage)
                     cfg = new_cfg
                     halted = False
@@ -100,38 +103,47 @@ def run() -> None:
             side = "BUY" if decision.delta > 0 else "SELL"
             result = execution.execute(api, cfg.symbol, side, qty)
 
-            position_after = market.get_position_amt(api, cfg.symbol)
+            # The order is live on the exchange from here. Everything below is
+            # bookkeeping, and a failure in it must not lose the fill record or
+            # strand active_index -- the order journal is the audit trail and the
+            # dataset a learned policy will train on.
+            try:
+                try:
+                    position_after = market.get_position_amt(api, cfg.symbol)
+                except Exception as exc:
+                    position_after = None
+                    journal.log_tick({"action": "error", "error": f"position_after failed: {exc}"})
 
-            journal.log_order(
-                {
-                    "order_id": result.get("orderId"),
-                    "client_order_id": result.get("clientOrderId"),
-                    "symbol": cfg.symbol,
-                    "side": side,
-                    "reason": decision.reason,
-                    "quantity": qty,
-                    "notional": qty * price,
-                    "mark_price": price,
-                    "trend": cfg.trend,
-                    "leverage": cfg.leverage,
-                    "alpha": cfg.alpha,
-                    "exposure_fraction": cfg.exposure_fraction,
-                    "active_zone_index": decision.zone_index,
-                    "support": zone.support if zone else None,
-                    "resistance": zone.resistance if zone else None,
-                    "d": decision.d,
-                    "max_notional": decision.max_n,
-                    "target_notional": decision.target_signed,
-                    "position_before": position_amt,
-                    "position_after": position_after,
-                    "balance": wallet,
-                    "available_balance": available,
-                    "unrealized_pnl": pnl,
-                }
-            )
-
-            print(f"{side} {qty} {cfg.symbol} @ ~{price} ({decision.reason})")
-            active_index = decision.zone_index
+                journal.log_order(
+                    {
+                        "order_id": result.get("orderId"),
+                        "client_order_id": result.get("clientOrderId"),
+                        "symbol": cfg.symbol,
+                        "side": side,
+                        "reason": decision.reason,
+                        "quantity": qty,
+                        "notional": qty * price,
+                        "mark_price": price,
+                        "trend": cfg.trend,
+                        "leverage": cfg.leverage,
+                        "alpha": cfg.alpha,
+                        "exposure_fraction": cfg.exposure_fraction,
+                        "active_zone_index": decision.zone_index,
+                        "support": zone.support if zone else None,
+                        "resistance": zone.resistance if zone else None,
+                        "d": decision.d,
+                        "max_notional": decision.max_n,
+                        "target_notional": decision.target_signed,
+                        "position_before": position_amt,
+                        "position_after": position_after,
+                        "balance": wallet,
+                        "available_balance": available,
+                        "unrealized_pnl": pnl,
+                    }
+                )
+                print(f"{side} {qty} {cfg.symbol} @ ~{price} ({decision.reason})")
+            finally:
+                active_index = decision.zone_index
 
         except KeyboardInterrupt:
             print("stopped by operator")
