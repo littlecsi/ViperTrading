@@ -102,16 +102,31 @@ collection.
   from those three payloads by the pure extractors; do not add a second fetch of an endpoint the
   snapshot already read. At `poll_seconds: 1` the earlier five-call tick cost 21 weight, 1260/min
   against Binance's 2400/min limit, and being rate limited means an IP ban while holding a leveraged
-  position the bot then cannot flatten. It also keeps the tick an actual snapshot: price, position, and
-  balance are read at one instant instead of five, so they cannot disagree with each other.
-- **The tick journal throttles only uneventful ticks** (`bot.TICK_LOG_INTERVAL_SECONDS`, with
-  `_should_log_tick` and the loop's `last_tick_log_at`). `HOLD`/`IDLE` ticks are written at most once
-  per 60 seconds of elapsed `time.monotonic()` — elapsed time, not a tick count, so the rate survives a
-  change to `poll_seconds`. Everything else is always written: `BUY`/`SELL`/`HALT` ticks and the
-  `config_error`, `config_refused`, `startup_refused`, and `error` records. Never turn this into
-  "write one tick in sixty" — the tick journal is the audit trail and the dataset a PPO policy will
-  train on, so blanket sampling would discard precisely the interesting events. Order-journal
-  behaviour is unconditional: every executed order writes a record.
+  position the bot then cannot flatten. It also narrows the tick from five instants to three - the two
+  values taken from the positions payload agree with each other, as do the two from the balances
+  payload - but three sequential round-trips are still three moments, so `Snapshot` is **not** an
+  atomic view and nothing should assume its fields are mutually consistent.
+- **The tick journal throttles repeated state, not "uneventful actions"** (`bot.TickLog`, floor
+  `bot.TICK_LOG_INTERVAL_SECONDS`). A tick record is written when an order is being sent, when the
+  tick's `(action, reason)` differs from the last record written, or when the interval has elapsed
+  since that record — otherwise it is skipped. Do **not** throttle on the action label instead: several
+  states are sticky, not momentary (`HALT` repeats every tick once price leaves the ladder, a residual
+  position below `min_notional` repeats `SCALE_OUT` that `is_executable` always rejects, an invalid
+  `settings.json` repeats `config_error`), so "always write anything that is not `HOLD`/`IDLE`" floods
+  the log in exactly the walked-away-operator case the throttle exists for. Transitions are never lost:
+  the first `HALT` tick and the tick that comes back out of it both differ from the record before them.
+  The interval is elapsed `time.monotonic()`, not a tick count, so the rate survives a change to
+  `poll_seconds`. `config_error` uses its own `TickLog` — sharing one with the tick stream would make
+  the two interleave and defeat both. `startup_refused`, `config_reloaded`, and the loop error
+  handler's `error` record call `journal.log_tick` directly and are never throttled; `config_refused`
+  is deduped separately by `refused_cfg`. Never turn this into "write one tick in sixty" — the tick
+  journal is the audit trail and the dataset a PPO policy will train on, so blanket sampling would
+  discard precisely the interesting events. Order-journal behaviour is unconditional: every executed
+  order writes a record.
+- **A successful settings reload writes a `config_reloaded` record** (`bot._log_config_reloaded`,
+  carrying the changed fields as `{field: [old, new]}`). Under the throttle the next tick record can be
+  up to a minute away, so without this the journal cannot say when an edit actually took effect. It is
+  the counterpart to `config_refused`; keep both.
 - **Order quantities floor to the lot step, never round up** (`execution.quantity_for` uses
   `math.floor`). Rounding up would let the bot exceed its own exposure cap on the last partial step of a
   fill — flooring is the only direction that cannot overshoot.

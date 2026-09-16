@@ -37,8 +37,14 @@ def get_filters(client, symbol: str) -> Filters:
 
 @dataclass(frozen=True)
 class Snapshot:
-    """Everything one tick needs about the market and the account, read at a
-    single instant."""
+    """Everything one tick needs about the market and the account, gathered in
+    one read per endpoint.
+
+    NOT an atomic view. get_snapshot makes three sequential HTTP round-trips,
+    so these fields come from three moments a few hundred milliseconds apart:
+    position and unrealized_pnl share one instant, wallet_balance and
+    available_balance share another, mark_price is a third. Do not build margin
+    or liquidation arithmetic on an assumption of consistency between them."""
 
     mark_price: float
     position_amt: float
@@ -96,10 +102,12 @@ def get_snapshot(client, symbol: str, asset: str = "USDT") -> Snapshot:
 
     At a one-second poll interval the old five-getter tick cost 21 weight
     (1260/min against a 2400/min limit) because /balance and /positionRisk were
-    each fetched twice. Beyond the rate-limit headroom, deriving every field
-    from one response per endpoint makes the tick a real snapshot: price,
-    position and balance can no longer disagree because they were read at
-    different instants."""
+    each fetched twice. Beyond the rate-limit headroom, taking every field from
+    one response per endpoint narrows the tick from five instants to three: the
+    two values read off the positions payload agree with each other, and so do
+    the two read off the balances payload. Three sequential round-trips are
+    still three moments, though - see the Snapshot docstring; this is fewer
+    disagreements, not none."""
     price = float(client.ticker_price(symbol)["price"])  # weight 1
     positions = client.get_position_risk(symbol=symbol)  # weight 5
     balances = client.balance()  # weight 5

@@ -1,5 +1,6 @@
 import time
 import traceback
+from dataclasses import asdict, fields, is_dataclass
 
 import client
 import execution
@@ -8,26 +9,106 @@ import market
 import settings
 import strategy
 
-# An uneventful tick (HOLD/IDLE) is journalled at most this often. At a
-# one-second poll the unthrottled log wrote ~86400 lines (~35 MB) a day, nearly
-# all of them identical no-ops. Only the uneventful ticks are throttled: every
-# tick where something actually happened is always written, because the tick
-# journal is both the audit trail and the dataset a learned policy trains on,
-# and dropping one tick in sixty indiscriminately would discard exactly the
-# interesting ones.
+# A tick that repeats the state of the one before it is journalled at most this
+# often. At a one-second poll the unthrottled log wrote ~86400 lines (~35 MB) a
+# day, nearly all of them identical.
 TICK_LOG_INTERVAL_SECONDS = 60.0
 
 
-def _should_log_tick(action, last_logged_at, now, interval=TICK_LOG_INTERVAL_SECONDS) -> bool:
-    """Throttle decision for a per-tick journal record.
+class TickLog:
+    """The tick journal's write policy: what got written, and when.
 
-    Elapsed time, not a tick counter, so the rate stays one-a-minute whatever
-    poll_seconds is set to."""
-    if action not in (strategy.HOLD, strategy.IDLE):
+    Throttling on the action LABEL (write anything that is not HOLD/IDLE) does
+    not work, because several of the loop's states are sticky rather than
+    momentary. Once price leaves the zone ladder every tick decides HALT; a
+    residual position too small to close decides SCALE_OUT forever while
+    is_executable rejects it every time; a settings.json left invalid raises on
+    every reload. Each of those writes one line per poll for as long as it
+    lasts - which is exactly the walked-away-operator scenario the throttle
+    exists for.
+
+    So the question is not what the action is called but whether this tick did
+    anything or changed anything:
+
+      - an order is being sent, or
+      - the (action, reason) pair differs from the last record written, or
+      - TICK_LOG_INTERVAL_SECONDS have passed since the last record.
+
+    A transition is therefore always on the record - the tick that first
+    decides HALT is written the moment it happens, as is the tick that comes
+    back out of it - while a steady repeat of one state collapses to a line a
+    minute. Nothing is ever sampled one-in-N: the tick journal is the audit
+    trail and the state/action history a PPO policy trains against, and blanket
+    sampling would thin out precisely the events it exists to capture.
+
+    Records that are discrete by nature bypass this and call journal.log_tick
+    directly: startup_refused and the loop's error handler (rare, and losing
+    one would hurt), config_reloaded (a reload happens once), and
+    config_refused (already deduped by the loop's own refused_cfg, which is
+    why the two mechanisms never see each other)."""
+
+    def __init__(self, interval: float = TICK_LOG_INTERVAL_SECONDS, clock=time.monotonic):
+        self._interval = interval
+        self._clock = clock
+        self._last_key = None
+        self._last_at = None
+
+    def should_write(self, key, forced: bool, now: float) -> bool:
+        if forced or self._last_at is None or key != self._last_key:
+            return True
+        return (now - self._last_at) >= self._interval
+
+    def log(self, record: dict, key, forced: bool = False) -> bool:
+        """Journal `record` unless it is a throttled repeat. Returns whether it
+        was written.
+
+        `key` identifies the state this record describes - equal keys are the
+        same state repeating. Elapsed clock time, not a tick count, so the
+        floor stays one-a-minute whatever poll_seconds is set to."""
+        now = self._clock()
+        if not self.should_write(key, forced, now):
+            return False
+        self._last_key = key
+        self._last_at = now
+        journal.log_tick(record)
         return True
-    if last_logged_at is None:
-        return True
-    return (now - last_logged_at) >= interval
+
+
+def _config_changes(old, new) -> dict:
+    """Which settings fields differ, as {field: [old, new]}, JSON-safe."""
+
+    def plain(value):
+        if isinstance(value, tuple):
+            return [plain(v) for v in value]
+        if is_dataclass(value):
+            return asdict(value)
+        return value
+
+    return {
+        f.name: [plain(getattr(old, f.name)), plain(getattr(new, f.name))]
+        for f in fields(new)
+        if getattr(old, f.name) != getattr(new, f.name)
+    }
+
+
+def _log_config_reloaded(cfg, changes: dict) -> None:
+    """Record that an edited settings.json actually took effect.
+
+    A successful reload used to be visible only as a console line, which was
+    survivable while the next tick's record - carrying the new trend, leverage
+    and zone bounds - was at most a second behind it. Under the throttle that
+    record can be a minute late, so without this the journal cannot say when a
+    config took effect. Counterpart to config_refused, and exempt from the
+    throttle: a reload is a discrete event, never a sustained state."""
+    journal.log_tick(
+        {
+            "action": "config_reloaded",
+            "symbol": cfg.symbol,
+            "trend": cfg.trend,
+            "leverage": cfg.leverage,
+            "changed": changes,
+        }
+    )
 
 
 def _ascii(value) -> str:
@@ -102,8 +183,8 @@ def run() -> None:
 
     active_index = None
     halted = False
-    # time.monotonic() of the last per-tick journal record; see _should_log_tick.
-    last_tick_log_at = None
+    tick_log = TickLog()
+    config_log = TickLog()
     # The config whose reload was last refused. Refusals are re-evaluated every
     # tick (the operator may flatten, or edit the file again), but only
     # announced when the refused config changes, so a walked-away operator does
@@ -182,17 +263,21 @@ def run() -> None:
                             # Zone state belongs to the old symbol's ladder and
                             # means nothing on the new one.
                             active_index = None
+                            changes = _config_changes(cfg, new_cfg)
                             cfg = new_cfg
                             halted = False
                             refused_cfg = None
                             print("settings reloaded")
+                            _log_config_reloaded(cfg, changes)
                     else:
                         if new_cfg.leverage != cfg.leverage:
                             market.set_leverage(api, new_cfg.symbol, new_cfg.leverage)
+                        changes = _config_changes(cfg, new_cfg)
                         cfg = new_cfg
                         halted = False
                         refused_cfg = None
                         print("settings reloaded")
+                        _log_config_reloaded(cfg, changes)
                 else:
                     # The file now matches what is running, so any earlier
                     # refusal is spent. Without this, an operator who sets
@@ -202,11 +287,20 @@ def run() -> None:
                     # exactly like the hazard it exists to prevent.
                     refused_cfg = None
             except (ValueError, KeyError, OSError) as exc:
-                journal.log_tick({"action": "config_error", "error": str(exc)})
+                # A settings.json left invalid raises here on every poll, so
+                # this is throttled like any other sustained state. It gets its
+                # own TickLog because the two streams interleave: sharing one
+                # would make config_error and the tick's own record alternate,
+                # each looking like a change from the last one written, and
+                # neither would ever be throttled.
+                config_log.log(
+                    {"action": "config_error", "error": str(exc)},
+                    key=("config_error", str(exc)),
+                )
 
-            # One read per endpoint for the whole tick: price, position and
-            # balance all come from the same instant, and the tick costs 11
-            # request weight instead of 21.
+            # One read per endpoint for the whole tick: 11 request weight
+            # instead of 21, and three instants instead of five. Three
+            # sequential round-trips are still three moments - see Snapshot.
             snapshot = market.get_snapshot(api, cfg.symbol)
             price = snapshot.mark_price
             position_amt = snapshot.position_amt
@@ -232,29 +326,38 @@ def run() -> None:
 
             zone = cfg.zones[decision.zone_index] if decision.zone_index is not None else None
 
-            now = time.monotonic()
-            if _should_log_tick(decision.action, last_tick_log_at, now):
-                last_tick_log_at = now
-                journal.log_tick(
-                    {
-                        "symbol": cfg.symbol,
-                        "mark_price": price,
-                        "trend": cfg.trend,
-                        "leverage": cfg.leverage,
-                        "active_zone_index": decision.zone_index,
-                        "support": zone.support if zone else None,
-                        "resistance": zone.resistance if zone else None,
-                        "d": decision.d,
-                        "max_notional": decision.max_n,
-                        "target_notional": decision.target_signed,
-                        "current_notional": position_notional,
-                        "delta": decision.delta,
-                        "action": decision.action,
-                        "reason": decision.reason,
-                        "balance": wallet,
-                        "unrealized_pnl": pnl,
-                    }
-                )
+            # Whether this tick actually sends an order decides whether its
+            # record survives the throttle, so the sizing check - pure
+            # arithmetic, no I/O - runs before the journal write. The record
+            # still goes in before the order is sent, not after.
+            qty = 0.0
+            sending = False
+            if decision.action not in (strategy.HOLD, strategy.IDLE):
+                qty = execution.quantity_for(decision.delta, price, filters)
+                sending = execution.is_executable(qty, price, filters)
+
+            tick_log.log(
+                {
+                    "symbol": cfg.symbol,
+                    "mark_price": price,
+                    "trend": cfg.trend,
+                    "leverage": cfg.leverage,
+                    "active_zone_index": decision.zone_index,
+                    "support": zone.support if zone else None,
+                    "resistance": zone.resistance if zone else None,
+                    "d": decision.d,
+                    "max_notional": decision.max_n,
+                    "target_notional": decision.target_signed,
+                    "current_notional": position_notional,
+                    "delta": decision.delta,
+                    "action": decision.action,
+                    "reason": decision.reason,
+                    "balance": wallet,
+                    "unrealized_pnl": pnl,
+                },
+                key=(decision.action, decision.reason),
+                forced=sending,
+            )
 
             if decision.action in (strategy.HOLD, strategy.IDLE):
                 active_index = decision.zone_index
@@ -265,8 +368,7 @@ def run() -> None:
                 print(f"HALT - price {price} left the zone ladder")
                 halted = True
 
-            qty = execution.quantity_for(decision.delta, price, filters)
-            if not execution.is_executable(qty, price, filters):
+            if not sending:
                 active_index = decision.zone_index
                 _sleep(cfg.poll_seconds)
                 continue
