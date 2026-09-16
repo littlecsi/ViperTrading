@@ -9,6 +9,31 @@ import settings
 import strategy
 
 
+def _ascii(value) -> str:
+    """Console-safe text.
+
+    This machine's console codepage is not UTF-8, and exchange/OS error
+    messages can arrive localised. A print() that raises UnicodeEncodeError
+    inside the error handler would end the process while it holds a leveraged
+    position, so every dynamic string printed from the handler goes through
+    here first."""
+    return str(value).encode("ascii", "replace").decode("ascii")
+
+
+def _sleep(seconds) -> None:
+    """Sleep the poll interval, clamped, and unable to raise.
+
+    settings.load() already rejects poll_seconds < 1, but this call sits
+    outside the per-tick try/except: anything that raises here ends an
+    unattended bot. Clamping locally means no config value can reach
+    time.sleep() unguarded even if it arrives by some other route."""
+    try:
+        delay = max(1.0, float(seconds))
+    except (TypeError, ValueError):
+        delay = 1.0
+    time.sleep(delay)
+
+
 def run() -> None:
     cfg = settings.load()
     api = client.build(cfg.testnet)
@@ -92,7 +117,7 @@ def run() -> None:
 
             if decision.action in (strategy.HOLD, strategy.IDLE):
                 active_index = decision.zone_index
-                time.sleep(cfg.poll_seconds)
+                _sleep(cfg.poll_seconds)
                 continue
 
             if decision.action == strategy.HALT and not halted:
@@ -102,7 +127,7 @@ def run() -> None:
             qty = execution.quantity_for(decision.delta, price, filters)
             if not execution.is_executable(qty, price, filters):
                 active_index = decision.zone_index
-                time.sleep(cfg.poll_seconds)
+                _sleep(cfg.poll_seconds)
                 continue
 
             side = "BUY" if decision.delta > 0 else "SELL"
@@ -155,12 +180,24 @@ def run() -> None:
             return
         except Exception as exc:
             # A transient API error must not kill an unattended bot, but it
-            # must be recorded rather than swallowed.
-            journal.log_tick({"action": "error", "error": str(exc)})
-            print("ERROR:", exc)
-            traceback.print_exc()
+            # must be recorded rather than swallowed. Nothing encloses this
+            # handler, so anything it raises itself - a Windows file lock on
+            # the journal it opens every tick, a localised OS error message
+            # that the console cannot encode - would propagate out of the loop
+            # and end the process holding a position. The handler is therefore
+            # built so that it cannot fail: each half is independently
+            # guarded, and the text is forced to ASCII before printing.
+            try:
+                journal.log_tick({"action": "error", "error": _ascii(exc)})
+            except Exception:
+                pass
+            try:
+                print("ERROR:", _ascii(exc))
+                traceback.print_exc()
+            except Exception:
+                pass
 
-        time.sleep(cfg.poll_seconds)
+        _sleep(cfg.poll_seconds)
 
 
 if __name__ == "__main__":
