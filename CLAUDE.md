@@ -75,7 +75,7 @@ Run from a directory where `futures/` modules can be imported as top-level modul
 and run `python bot.py`, or run with `futures/` on `PYTHONPATH`) — `futures/` is not a package and its
 modules use flat imports (`import market`, `from settings import Zone`, etc.), not `futures.market`.
 
-Tests: 58 tests live under `tests/`, run with:
+Tests live under `tests/`, run with:
 
 ```
 .viper/Scripts/python.exe -m pytest tests/ -v
