@@ -1,3 +1,5 @@
+import pytest
+
 import execution
 from market import Filters
 
@@ -78,3 +80,41 @@ def test_execute_sets_reduce_only_when_requested():
     c = FakeClient()
     execution.execute(c, "ETHUSDT", "SELL", 0.041, reduce_only=True)
     assert c.orders[0]["reduceOnly"] == "true"
+
+
+def test_fill_from_response_reads_avg_price():
+    fill = execution.fill_from_response(
+        {"avgPrice": "2395.16307", "executedQty": "0.876", "cumQuote": "2098.16285"}
+    )
+    assert fill.price == 2395.16307
+    assert fill.qty == 0.876
+    assert fill.notional == 2098.16285
+
+
+def test_fill_from_response_derives_price_from_cum_quote():
+    # A futures MARKET response can report executedQty while avgPrice is still
+    # "0.00"; cumQuote still carries the true notional.
+    fill = execution.fill_from_response(
+        {"avgPrice": "0.00", "executedQty": "0.876", "cumQuote": "2098.16285"}
+    )
+    assert fill.qty == 0.876
+    assert fill.notional == 2098.16285
+    assert fill.price == pytest.approx(2098.16285 / 0.876)
+
+
+def test_fill_from_response_derives_notional_when_only_price_known():
+    fill = execution.fill_from_response({"avgPrice": "2400.0", "executedQty": "0.5"})
+    assert fill.notional == 1200.0
+
+
+def test_fill_from_response_reports_unknown_fill_as_none():
+    # An ACK-shaped response carries nothing usable; recording None keeps the
+    # schema honest instead of substituting a pre-trade estimate.
+    fill = execution.fill_from_response(
+        {"orderId": 1, "status": "NEW", "avgPrice": "0.00", "executedQty": "0", "cumQuote": "0"}
+    )
+    assert fill == execution.Fill(price=None, qty=None, notional=None)
+
+
+def test_fill_from_response_tolerates_missing_fields():
+    assert execution.fill_from_response({}) == execution.Fill(None, None, None)

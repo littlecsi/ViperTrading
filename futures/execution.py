@@ -1,6 +1,20 @@
 import math
+from dataclasses import dataclass
 
 from market import Filters
+
+
+@dataclass(frozen=True)
+class Fill:
+    """What an order actually did, as opposed to what it was asked to do.
+
+    Every field is optional because the exchange response is the only source
+    here: when it carries no fill data the journal must say so rather than
+    fall back to a pre-trade estimate dressed up as a fill."""
+
+    price: float | None
+    qty: float | None
+    notional: float | None
 
 
 def quantity_for(delta_notional: float, price: float, filters: Filters) -> float:
@@ -19,6 +33,37 @@ def is_executable(qty: float, price: float, filters: Filters) -> bool:
     if qty <= 0 or qty < filters.min_qty:
         return False
     return qty * price >= filters.min_notional
+
+
+def _positive(value) -> float | None:
+    """Parse a numeric response field, treating absent, unparseable and zero
+    alike: Binance reports "0.00" for fill fields it has not computed yet."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def fill_from_response(result: dict) -> Fill:
+    """Extract the realised fill from a new_order response.
+
+    avgPrice is the direct answer, but a futures MARKET response can come back
+    with executedQty set and avgPrice still "0.00"; cumQuote (the cumulative
+    quote quantity) then carries the true notional and implies the average
+    price. Anything still unknown stays None - the alternative, quietly
+    substituting the pre-trade mark price, is what made the old records
+    understate trading cost."""
+    price = _positive(result.get("avgPrice"))
+    qty = _positive(result.get("executedQty"))
+    notional = _positive(result.get("cumQuote"))
+
+    if notional is None and price is not None and qty is not None:
+        notional = price * qty
+    if price is None and notional is not None and qty is not None:
+        price = notional / qty
+
+    return Fill(price=price, qty=qty, notional=notional)
 
 
 def execute(

@@ -34,16 +34,6 @@ def _sleep(seconds) -> None:
     time.sleep(delay)
 
 
-def _opt_float(value) -> float | None:
-    """Parse an optional numeric field from an exchange response. Returns None
-    when the field is absent or unparseable, so the journal records a known
-    gap instead of a fabricated zero."""
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def run() -> None:
     cfg = settings.load()
     api = client.build(cfg.testnet)
@@ -275,13 +265,7 @@ def run() -> None:
                 # exchange returned no fill data. Commission needs a separate
                 # userTrades call that this loop deliberately does not make;
                 # the fields are present and null so the gap is explicit.
-                fill_price = _opt_float(result.get("avgPrice")) or None
-                executed_qty = _opt_float(result.get("executedQty")) or None
-                fill_notional = (
-                    fill_price * executed_qty
-                    if fill_price is not None and executed_qty is not None
-                    else None
-                )
+                fill = execution.fill_from_response(result)
 
                 journal.log_order(
                     {
@@ -291,9 +275,9 @@ def run() -> None:
                         "side": side,
                         "reason": decision.reason,
                         "quantity": qty,
-                        "executed_qty": executed_qty,
-                        "fill_price": fill_price,
-                        "notional": fill_notional,
+                        "executed_qty": fill.qty,
+                        "fill_price": fill.price,
+                        "notional": fill.notional,
                         "commission": None,
                         "commission_asset": None,
                         "reduce_only": reduce_only,
