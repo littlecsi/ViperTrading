@@ -839,7 +839,21 @@ git commit -m "[add] pure decision function for zone-scaling strategy"
 
 **Interfaces:**
 - Consumes: `config.api_key`, `config.api_secret`, `config.testnet_key`, `config.testnet_secret`
-- Produces: `build(testnet: bool) -> UMFutures`, `test_connection(testnet: bool = True) -> None`
+- Produces: `build(testnet: bool) -> UMFutures`, `sync_time(testnet: bool) -> int`, `test_connection(testnet: bool = True) -> None`
+
+**Clock skew is mandatory, not optional.** This has been measured empirically on
+the target machine: the local clock runs ~2000ms **ahead** of Binance's server,
+and Binance rejects any signed request with a future timestamp (error -1021,
+"Timestamp for this request was 1000ms ahead of the server's time"). The
+connector builds timestamps from raw `time.time()` and exposes no offset hook,
+so without this fix **every authenticated call fails** and nothing past Task 6
+can work.
+
+The patch target is subtle and already cost investigation time: patch
+`binance.api.get_timestamp`, **not** `binance.lib.utils.get_timestamp`.
+`api.py` does `from binance.lib.utils import get_timestamp`, binding the name
+into its own module namespace, so rebinding it in `lib.utils` has no effect on
+the code that actually runs.
 
 `trading.py` is superseded — its balance lookup moves to `market.py` (Task 7) and its order placement to `execution.py` (Task 8). Removing it now prevents a second, divergent path to the same endpoints.
 
@@ -857,6 +871,9 @@ testnet_secret = ""
 Replace the contents of `futures/client.py`:
 
 ```python
+import time
+
+import binance.api
 from binance.um_futures import UMFutures
 
 import config
@@ -864,9 +881,41 @@ import config
 TESTNET_URL = "https://testnet.binancefuture.com"
 
 
+def _measure_offset(probe: UMFutures, samples: int = 5) -> int:
+    """Median of (server time - local midpoint) in milliseconds.
+
+    Uses the midpoint of the local clock readings taken either side of the
+    call so that network latency cancels out instead of biasing the offset."""
+    offsets = []
+    for _ in range(samples):
+        before = int(time.time() * 1000)
+        server = probe.time()["serverTime"]
+        after = int(time.time() * 1000)
+        offsets.append(server - (before + after) // 2)
+    return sorted(offsets)[len(offsets) // 2]
+
+
+def sync_time(testnet: bool) -> int:
+    """Align outgoing request timestamps with Binance's clock.
+
+    Binance rejects signed requests whose timestamp runs ahead of its server,
+    and this machine's clock does exactly that. The connector offers no offset
+    hook, so the offset is measured once against a public endpoint and applied
+    to every timestamp thereafter.
+
+    Patches binance.api rather than binance.lib.utils: api.py imports
+    get_timestamp by name, so rebinding it in the source module would not
+    affect the code that actually runs."""
+    probe = UMFutures(base_url=TESTNET_URL) if testnet else UMFutures()
+    offset = _measure_offset(probe)
+    binance.api.get_timestamp = lambda: int(time.time() * 1000) + offset
+    return offset
+
+
 def build(testnet: bool) -> UMFutures:
     """Construct a Futures client. Testnet uses entirely separate
     credentials from live — they are not interchangeable."""
+    sync_time(testnet)
     if testnet:
         return UMFutures(
             key=config.testnet_key,
