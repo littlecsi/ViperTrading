@@ -12,13 +12,25 @@ def get_filters(client, symbol: str) -> Filters:
     info = client.exchange_info()
     entry = next(s for s in info["symbols"] if s["symbol"] == symbol)
 
-    step_size = min_qty = min_notional = 0.0
+    step_size = min_qty = min_notional = None
     for f in entry["filters"]:
         if f["filterType"] == "LOT_SIZE":
             step_size = float(f["stepSize"])
             min_qty = float(f["minQty"])
         elif f["filterType"] == "MIN_NOTIONAL":
             min_notional = float(f["notional"])
+
+    # Defaulting an unresolved filter to zero turns both safety limits into no
+    # limit: a zero step_size divides by zero when sizing, and a zero
+    # min_notional lets the churn guard and the executable check pass anything.
+    # A missing filter must be fatal at startup, not a silent degrade.
+    for name, value in (
+        ("LOT_SIZE", step_size),
+        ("LOT_SIZE", min_qty),
+        ("MIN_NOTIONAL", min_notional),
+    ):
+        if value is None or value <= 0:
+            raise ValueError(f"{symbol}: missing {name} filter")
 
     return Filters(step_size=step_size, min_qty=min_qty, min_notional=min_notional)
 

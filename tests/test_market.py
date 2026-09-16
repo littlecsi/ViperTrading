@@ -1,3 +1,5 @@
+import pytest
+
 import market
 
 
@@ -41,6 +43,31 @@ def test_get_filters():
     assert f.step_size == 0.001
     assert f.min_qty == 0.001
     assert f.min_notional == 20.0
+
+
+class MissingFilterClient(FakeClient):
+    """exchange_info without MIN_NOTIONAL: a renamed filter, a new symbol, or
+    testnet diverging from live would all look like this."""
+
+    def __init__(self, drop="MIN_NOTIONAL"):
+        super().__init__()
+        self.drop = drop
+
+    def exchange_info(self):
+        info = super().exchange_info()
+        entry = info["symbols"][0]
+        entry["filters"] = [f for f in entry["filters"] if f["filterType"] != self.drop]
+        return info
+
+
+def test_get_filters_raises_when_min_notional_missing():
+    with pytest.raises(ValueError, match="MIN_NOTIONAL"):
+        market.get_filters(MissingFilterClient(), "ETHUSDT")
+
+
+def test_get_filters_raises_when_lot_size_missing():
+    with pytest.raises(ValueError, match="LOT_SIZE"):
+        market.get_filters(MissingFilterClient("LOT_SIZE"), "ETHUSDT")
 
 
 def test_get_mark_price():
