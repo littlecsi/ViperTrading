@@ -1,0 +1,16 @@
+{
+  "symbol": "ETHUSDT",
+  "trend": "long",
+  "leverage": 5,
+  "alpha": 2.0,
+  "exposure_fraction": 1.0,
+  "rebalance_threshold": 0.05,
+  "stop_buffer": 0.01,
+  "poll_seconds": 5,
+  "testnet": true,
+  "zones": [
+    { "support": 2625.00, "resistance": 3284.04 },
+    { "support": 2371.26, "resistance": 2625.00 },
+    { "support": 1872.46, "resistance": 2371.26 }
+  ]
+}
