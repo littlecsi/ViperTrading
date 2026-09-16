@@ -142,9 +142,9 @@ also how Omen will drive the bot later: it writes this file.
   "poll_seconds": 5,
   "testnet": true,
   "zones": [
-    { "support": 2350, "resistance": 2450 },
-    { "support": 2250, "resistance": 2350 },
-    { "support": 2150, "resistance": 2250 }
+    { "support": 2625.00, "resistance": 3284.04 },
+    { "support": 2371.26, "resistance": 2625.00 },
+    { "support": 1872.46, "resistance": 2371.26 }
   ]
 }
 ```
@@ -262,7 +262,7 @@ Chosen by the operator on 2026-09-16:
 | `stop_buffer` | 0.01 | |
 | `poll_seconds` | 5 | |
 | `testnet` | true | $1000 virtual balance |
-| `zones` | **operator to supply** | seeded with a placeholder ladder around $2403 |
+| `zones` | 3 contiguous zones | from operator levels 1872.46 / 2371.26 / 2625.00 / 3284.04 |
 
 At $1000 / 5x / 1.0 the maximum position is $5000 (~2.08 ETH). With a $2.40
 lot step that is ~2000 discrete size steps, so scaling is effectively smooth.
