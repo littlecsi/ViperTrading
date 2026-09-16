@@ -8,6 +8,27 @@ import market
 import settings
 import strategy
 
+# An uneventful tick (HOLD/IDLE) is journalled at most this often. At a
+# one-second poll the unthrottled log wrote ~86400 lines (~35 MB) a day, nearly
+# all of them identical no-ops. Only the uneventful ticks are throttled: every
+# tick where something actually happened is always written, because the tick
+# journal is both the audit trail and the dataset a learned policy trains on,
+# and dropping one tick in sixty indiscriminately would discard exactly the
+# interesting ones.
+TICK_LOG_INTERVAL_SECONDS = 60.0
+
+
+def _should_log_tick(action, last_logged_at, now, interval=TICK_LOG_INTERVAL_SECONDS) -> bool:
+    """Throttle decision for a per-tick journal record.
+
+    Elapsed time, not a tick counter, so the rate stays one-a-minute whatever
+    poll_seconds is set to."""
+    if action not in (strategy.HOLD, strategy.IDLE):
+        return True
+    if last_logged_at is None:
+        return True
+    return (now - last_logged_at) >= interval
+
 
 def _ascii(value) -> str:
     """Console-safe text.
@@ -81,6 +102,8 @@ def run() -> None:
 
     active_index = None
     halted = False
+    # time.monotonic() of the last per-tick journal record; see _should_log_tick.
+    last_tick_log_at = None
     # The config whose reload was last refused. Refusals are re-evaluated every
     # tick (the operator may flatten, or edit the file again), but only
     # announced when the refused config changes, so a walked-away operator does
@@ -209,26 +232,29 @@ def run() -> None:
 
             zone = cfg.zones[decision.zone_index] if decision.zone_index is not None else None
 
-            journal.log_tick(
-                {
-                    "symbol": cfg.symbol,
-                    "mark_price": price,
-                    "trend": cfg.trend,
-                    "leverage": cfg.leverage,
-                    "active_zone_index": decision.zone_index,
-                    "support": zone.support if zone else None,
-                    "resistance": zone.resistance if zone else None,
-                    "d": decision.d,
-                    "max_notional": decision.max_n,
-                    "target_notional": decision.target_signed,
-                    "current_notional": position_notional,
-                    "delta": decision.delta,
-                    "action": decision.action,
-                    "reason": decision.reason,
-                    "balance": wallet,
-                    "unrealized_pnl": pnl,
-                }
-            )
+            now = time.monotonic()
+            if _should_log_tick(decision.action, last_tick_log_at, now):
+                last_tick_log_at = now
+                journal.log_tick(
+                    {
+                        "symbol": cfg.symbol,
+                        "mark_price": price,
+                        "trend": cfg.trend,
+                        "leverage": cfg.leverage,
+                        "active_zone_index": decision.zone_index,
+                        "support": zone.support if zone else None,
+                        "resistance": zone.resistance if zone else None,
+                        "d": decision.d,
+                        "max_notional": decision.max_n,
+                        "target_notional": decision.target_signed,
+                        "current_notional": position_notional,
+                        "delta": decision.delta,
+                        "action": decision.action,
+                        "reason": decision.reason,
+                        "balance": wallet,
+                        "unrealized_pnl": pnl,
+                    }
+                )
 
             if decision.action in (strategy.HOLD, strategy.IDLE):
                 active_index = decision.zone_index
