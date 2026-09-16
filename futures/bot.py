@@ -42,10 +42,14 @@ class TickLog:
     sampling would thin out precisely the events it exists to capture.
 
     Records that are discrete by nature bypass this and call journal.log_tick
-    directly: startup_refused and the loop's error handler (rare, and losing
-    one would hurt), config_reloaded (a reload happens once), and
-    config_refused (already deduped by the loop's own refused_cfg, which is
-    why the two mechanisms never see each other)."""
+    directly: startup_refused (it fires once, and losing it would hurt),
+    config_reloaded (a reload happens once), and config_refused (already
+    deduped by the loop's own refused_cfg, which is why the two mechanisms
+    never see each other).
+
+    Each record stream needs its OWN instance. The streams interleave within a
+    tick, so one shared log would see alternating keys, call every record a
+    change from the last, and throttle none of them."""
 
     def __init__(self, interval: float = TICK_LOG_INTERVAL_SECONDS, clock=time.monotonic):
         self._interval = interval
@@ -68,9 +72,13 @@ class TickLog:
         now = self._clock()
         if not self.should_write(key, forced, now):
             return False
+        # Marked only once the record is actually on disk. Marking first would
+        # let a failed write (the journal file is opened every tick, and a
+        # Windows file lock on it is the very hazard the loop's error handler
+        # is built around) silence this state for the rest of the interval.
+        journal.log_tick(record)
         self._last_key = key
         self._last_at = now
-        journal.log_tick(record)
         return True
 
 
@@ -183,8 +191,12 @@ def run() -> None:
 
     active_index = None
     halted = False
+    # One write policy per record stream. They must not share: the streams
+    # interleave within a tick, so through a single log each record would look
+    # like a change from the last one written and none of them would throttle.
     tick_log = TickLog()
     config_log = TickLog()
+    error_log = TickLog()
     # The config whose reload was last refused. Refusals are re-evaluated every
     # tick (the operator may flatten, or edit the file again), but only
     # announced when the refused config changes, so a walked-away operator does
@@ -195,6 +207,10 @@ def run() -> None:
         try:
             # Re-read settings each tick so trend, leverage, and zones can be
             # changed without a restart. Invalid edits are ignored, not fatal.
+            # An applied reload is journalled AFTER this block, not inside it:
+            # a journal write that failed here would be recorded by the handler
+            # below as a config_error, which is the opposite of what happened.
+            reloaded = None
             try:
                 new_cfg = settings.load()
                 if new_cfg != cfg:
@@ -268,7 +284,7 @@ def run() -> None:
                             halted = False
                             refused_cfg = None
                             print("settings reloaded")
-                            _log_config_reloaded(cfg, changes)
+                            reloaded = changes
                     else:
                         if new_cfg.leverage != cfg.leverage:
                             market.set_leverage(api, new_cfg.symbol, new_cfg.leverage)
@@ -277,7 +293,7 @@ def run() -> None:
                         halted = False
                         refused_cfg = None
                         print("settings reloaded")
-                        _log_config_reloaded(cfg, changes)
+                        reloaded = changes
                 else:
                     # The file now matches what is running, so any earlier
                     # refusal is spent. Without this, an operator who sets
@@ -286,7 +302,12 @@ def run() -> None:
                     # message is the entire mitigation. A silent refusal reads
                     # exactly like the hazard it exists to prevent.
                     refused_cfg = None
-            except (ValueError, KeyError, OSError) as exc:
+            # TypeError belongs with the rest: a null or wrong-typed field
+            # ("leverage": null) reaches int()/float() and raises it, and a
+            # malformed config is a config error, not a generic loop fault.
+            # Left out it would escape to the handler at the bottom of the loop
+            # and write an unthrottled error record on every single poll.
+            except (TypeError, ValueError, KeyError, OSError) as exc:
                 # A settings.json left invalid raises here on every poll, so
                 # this is throttled like any other sustained state. It gets its
                 # own TickLog because the two streams interleave: sharing one
@@ -297,6 +318,9 @@ def run() -> None:
                     {"action": "config_error", "error": str(exc)},
                     key=("config_error", str(exc)),
                 )
+
+            if reloaded is not None:
+                _log_config_reloaded(cfg, reloaded)
 
             # One read per endpoint for the whole tick: 11 request weight
             # instead of 21, and three instants instead of five. Three
@@ -454,8 +478,19 @@ def run() -> None:
             # and end the process holding a position. The handler is therefore
             # built so that it cannot fail: each half is independently
             # guarded, and the text is forced to ASCII before printing.
+            #
+            # Throttled on the message, because a failing order repeats. With
+            # exposure_fraction at 1.0 the required margin exceeds the wallet
+            # as d approaches 1, and Binance rejects with -2019 on every poll -
+            # right where the strategy wants its largest position. Unthrottled
+            # that is one error record per poll on top of the tick's own record.
+            # Keyed on the text, so a NEW, different failure is still written
+            # the instant it happens; only an identical repeat collapses.
             try:
-                journal.log_tick({"action": "error", "error": _ascii(exc)})
+                message = _ascii(exc)
+                error_log.log(
+                    {"action": "error", "error": message}, key=("error", message)
+                )
             except Exception:
                 pass
             try:

@@ -32,13 +32,14 @@ The active system lives in `futures/`:
 - `futures/execution.py` — quantity flooring to the lot step, exchange filter checks, and market-order
   placement.
 - `futures/journal.py` — two JSONL logs under `futures/logs/` (gitignored): `ticks-YYYY-MM-DD.jsonl`
-  (one line per loop iteration where something happened; uneventful ones are throttled — see
-  architecture notes below) and `orders-YYYY-MM-DD.jsonl` (one line per executed order, carrying a full
-  environment snapshot at fill time).
-- `futures/bot.py` — the polling loop (entry point). Owns only three pieces of mutable state across
+  (one line per record the loop hands it — a repeated state is written at most once per interval, see
+  architecture notes below; `journal.py` writes, it does not decide) and `orders-YYYY-MM-DD.jsonl` (one
+  line per executed order, carrying a full environment snapshot at fill time).
+- `futures/bot.py` — the polling loop (entry point). Owns only five pieces of mutable state across
   iterations: `active_index` (which zone is currently being worked), `halted` (whether the
-  HALT-left-the-ladder notice has already been printed), and `last_tick_log_at` (when the tick journal
-  last wrote, for the throttle).
+  HALT-left-the-ladder notice has already been printed), `refused_cfg` (the settings edit whose reload
+  was last refused), and one `TickLog` per journal record stream — `tick_log`, `config_log`,
+  `error_log`.
 
 `binance/` (`binance/main.py`, `binance/biat.py`) is the **legacy Spot bot** — a volatility-breakout
 strategy for Spot XRP/USDT with Slack alerting. It is retained for reference but is **out of scope and
@@ -116,10 +117,18 @@ collection.
   the log in exactly the walked-away-operator case the throttle exists for. Transitions are never lost:
   the first `HALT` tick and the tick that comes back out of it both differ from the record before them.
   The interval is elapsed `time.monotonic()`, not a tick count, so the rate survives a change to
-  `poll_seconds`. `config_error` uses its own `TickLog` — sharing one with the tick stream would make
-  the two interleave and defeat both. `startup_refused`, `config_reloaded`, and the loop error
-  handler's `error` record call `journal.log_tick` directly and are never throttled; `config_refused`
-  is deduped separately by `refused_cfg`. Never turn this into "write one tick in sixty" — the tick
+  `poll_seconds`. **One `TickLog` per record stream, never a shared one**: the tick, `config_error`,
+  and `error` streams interleave within a tick, so through a single log every record would look like a
+  change from the last and none would throttle. `config_error` is keyed on its message and the loop
+  error handler's `error` record on `("error", <message>)` — a persistently rejected order (`-2019`
+  when required margin exceeds the wallet, which is where `exposure_fraction: 1.0` puts the strategy at
+  its largest) would otherwise write a line every poll, while a NEW distinct failure is still recorded
+  the instant it happens. `startup_refused` and `config_reloaded` call `journal.log_tick` directly and
+  are never throttled; `config_refused` is deduped separately by `refused_cfg`. A malformed
+  `settings.json` must be caught as a `config_error` — the reload handler catches `TypeError` as well
+  as `ValueError`/`KeyError`/`OSError`, because `"leverage": null` reaches `int(None)` and a
+  `TypeError` escaping there becomes an unthrottled loop error every poll. Never turn this into
+  "write one tick in sixty" — the tick
   journal is the audit trail and the dataset a PPO policy will train on, so blanket sampling would
   discard precisely the interesting events. Order-journal behaviour is unconditional: every executed
   order writes a record.
@@ -152,6 +161,7 @@ collection.
   ahead of Binance's server clock, and Binance rejects a signed request whose timestamp is in the
   future with error -1021; the offset is measured once at startup against a public endpoint and applied
   to every subsequent timestamp.
-- `bot.py` holds only `active_index`, `halted`, and `last_tick_log_at` as mutable loop state;
-  `market.py`, `strategy.py`, `execution.py`, and `journal.py` are stateless and take all inputs as
-  arguments — don't reintroduce module-level mutable state into them.
+- `bot.py` holds the loop's mutable state — `active_index`, `halted`, `refused_cfg`, and the
+  `tick_log`/`config_log`/`error_log` `TickLog` instances; `market.py`, `strategy.py`, `execution.py`,
+  and `journal.py` are stateless and take all inputs as arguments — don't reintroduce module-level
+  mutable state into them.

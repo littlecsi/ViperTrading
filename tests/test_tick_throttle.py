@@ -203,3 +203,136 @@ def test_config_reloaded_record_is_written_unthrottled(written):
     assert len(written) == 3
     assert written[0]["action"] == "config_reloaded"
     assert written[0]["changed"] == {"leverage": [5, 10]}
+
+
+# --- the whole loop: sustained failures must not flood --------------------
+#
+# These drive the real bot.run() so the wiring is covered, not just the policy
+# object: a TickLog that is correct but wired to the wrong stream would pass
+# every test above and still flood the journal.
+
+
+class LoopClient:
+    """Enough of UMFutures for one trip round bot.run()."""
+
+    def __init__(self, price="2700.00", balance="0.0", order_error=None):
+        self.price = price
+        self._balance = balance
+        self.order_error = order_error
+        self.orders = 0
+
+    def exchange_info(self):
+        return {
+            "symbols": [
+                {
+                    "symbol": "ETHUSDT",
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+                        {"filterType": "MIN_NOTIONAL", "notional": "20"},
+                    ],
+                }
+            ]
+        }
+
+    def change_leverage(self, symbol, leverage):
+        return {"symbol": symbol, "leverage": leverage}
+
+    def ticker_price(self, symbol):
+        return {"symbol": symbol, "price": self.price}
+
+    def balance(self):
+        return [{"asset": "USDT", "balance": self._balance, "availableBalance": self._balance}]
+
+    def get_position_risk(self, symbol=None):
+        return [{"symbol": "ETHUSDT", "positionAmt": "0.0", "unRealizedProfit": "0.0"}]
+
+    def new_order(self, **params):
+        self.orders += 1
+        if self.order_error is not None:
+            raise RuntimeError(self.order_error(self.orders))
+        return {"orderId": self.orders, "avgPrice": "0", "executedQty": "0", "cumQuote": "0"}
+
+
+def run_loop(monkeypatch, written, ticks, api=None, load=None):
+    """Run bot.run() for `ticks` polls on a fake clock, returning the records."""
+    api = api or LoopClient()
+    clock = Clock()
+    real_ticklog = bot.TickLog
+
+    monkeypatch.setattr(bot.client, "build", lambda testnet: api)
+    monkeypatch.setattr(bot, "TickLog", lambda *a, **kw: real_ticklog(clock=clock))
+    monkeypatch.setattr(journal, "log_order", lambda record, log_dir=None: None)
+
+    if load is not None:
+        real_load = bot.settings.load
+        calls = {"n": 0}
+
+        def patched(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] > 1:  # the first call is startup, before the loop
+                return load()
+            return real_load(*a, **kw)
+
+        monkeypatch.setattr(bot.settings, "load", patched)
+
+    polls = {"n": 0}
+
+    def sleep(seconds):
+        polls["n"] += 1
+        if polls["n"] >= ticks:
+            raise KeyboardInterrupt
+        clock.advance(1.0)  # poll_seconds is 1
+
+    monkeypatch.setattr(bot, "_sleep", sleep)
+    try:
+        # run() catches KeyboardInterrupt only inside the per-tick try; the
+        # sleep that ends a tick which placed an order sits outside it.
+        bot.run()
+    except KeyboardInterrupt:
+        pass
+    assert polls["n"] == ticks
+    return written
+
+
+def actions(records):
+    counts = {}
+    for r in records:
+        counts[r.get("action")] = counts.get(r.get("action"), 0) + 1
+    return counts
+
+
+def test_type_error_from_settings_is_a_config_error_not_a_loop_error(monkeypatch, written):
+    """'leverage': null reaches int(None). If TypeError escapes the reload
+    handler it becomes an unthrottled loop error - one record per poll."""
+
+    def broken():
+        raise TypeError("int() argument must be a string or a number, not 'NoneType'")
+
+    records = run_loop(monkeypatch, written, ticks=300, load=broken)
+    counts = actions(records)
+    assert counts["config_error"] == 5  # 299s of polling, not 300 records
+    assert "error" not in counts  # never reached the loop's generic handler
+
+
+def test_repeated_order_rejection_collapses(monkeypatch, written):
+    """-2019 repeats on every poll once required margin exceeds the wallet."""
+    api = LoopClient(balance="1000.0", order_error=lambda n: "-2019 Margin is insufficient")
+    records = run_loop(monkeypatch, written, ticks=300, api=api)
+
+    assert api.orders == 300  # the bot kept trying, as it should
+    assert actions(records)["error"] == 5
+
+
+def test_a_different_error_is_written_immediately(monkeypatch, written):
+    api = LoopClient(
+        balance="1000.0",
+        order_error=lambda n: "-2019 Margin is insufficient" if n <= 90 else "-1021 Timestamp",
+    )
+    records = run_loop(monkeypatch, written, ticks=95, api=api)
+
+    errors = [r["error"] for r in records if r.get("action") == "error"]
+    assert errors == [
+        "-2019 Margin is insufficient",  # first failure
+        "-2019 Margin is insufficient",  # 60s later
+        "-1021 Timestamp",  # the tick it changed, not 60s after
+    ]

@@ -18,17 +18,17 @@ def _append(prefix: str, record: dict, log_dir: str | None) -> None:
 
 
 def log_tick(record: dict, log_dir: str | None = None) -> None:
-    """One line per record the caller hands over: the loop's audit trail and
-    the state/action history a PPO policy trains against.
+    """Append one line per record handed over: the loop's audit trail and the
+    state/action history a PPO policy trains against.
 
-    This function writes whatever it is given; the cadence is the caller's
-    decision, and bot.py does not call it on every iteration. Uneventful ticks
-    (HOLD/IDLE) are throttled there to one per bot.TICK_LOG_INTERVAL_SECONDS,
-    while every tick where something happened, and every non-decision record,
-    is always passed here. So a gap between consecutive uneventful ticks is
-    expected and is not a dropped write. Note what is NOT done: ticks are never
-    sampled one-in-N, because that would thin out exactly the events this log
-    exists to capture."""
+    Everything given to it is written. What is NOT done is sample one record in
+    N - that would thin out exactly the events this log exists to capture.
+
+    The cadence is not this module's to describe: bot.py does not call this
+    every iteration, and bot.TickLog owns the rule for which records are
+    written and when. A gap between records is therefore expected rather than a
+    dropped write. Read TickLog for the policy; restating it here only earns a
+    docstring that goes stale the next time the policy changes."""
     _append("ticks", record, log_dir)
 
 
