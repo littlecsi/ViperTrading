@@ -46,6 +46,11 @@ def run() -> None:
 
     active_index = None
     halted = False
+    # The config whose reload was last refused. Refusals are re-evaluated every
+    # tick (the operator may flatten, or edit the file again), but only
+    # announced when the refused config changes, so a walked-away operator does
+    # not come back to 17k identical lines.
+    refused_cfg = None
 
     while True:
         try:
@@ -54,19 +59,82 @@ def run() -> None:
             try:
                 new_cfg = settings.load()
                 if new_cfg != cfg:
-                    if new_cfg.symbol != cfg.symbol:
-                        # Fetch into a temporary: if set_leverage below fails,
-                        # the previous symbol's filters stay in force.
-                        # Committing filters early would leave cfg on the old
-                        # symbol while sizing orders off the new symbol's lot step.
-                        new_filters = market.get_filters(api, new_cfg.symbol)
-                        market.set_leverage(api, new_cfg.symbol, new_cfg.leverage)
-                        filters = new_filters
-                    elif new_cfg.leverage != cfg.leverage:
-                        market.set_leverage(api, new_cfg.symbol, new_cfg.leverage)
-                    cfg = new_cfg
-                    halted = False
-                    print("settings reloaded")
+                    announce = new_cfg != refused_cfg
+                    if new_cfg.testnet != cfg.testnet:
+                        # Nothing downstream re-reads cfg.testnet, and rebuilding
+                        # the client here would swap accounts underneath an open
+                        # position. Refuse the WHOLE reload: adopting the rest of
+                        # the file while silently ignoring a live/testnet switch
+                        # is how an operator "makes it safe" and walks away from a
+                        # bot still trading real money.
+                        refused_cfg = new_cfg
+                        if announce:
+                            print("*** SETTINGS RELOAD REFUSED ***")
+                            print(
+                                f"  'testnet' changed {cfg.testnet} -> {new_cfg.testnet}; "
+                                "switching between live and testnet requires a RESTART."
+                            )
+                            print(
+                                f"  The bot is STILL RUNNING on {label} with the previous "
+                                "settings. No part of the new file was applied."
+                            )
+                            journal.log_tick(
+                                {
+                                    "action": "config_refused",
+                                    "reason": "testnet_change_requires_restart",
+                                    "current_testnet": cfg.testnet,
+                                    "rejected_testnet": new_cfg.testnet,
+                                }
+                            )
+                    elif new_cfg.symbol != cfg.symbol:
+                        # Adopting a new symbol while the old one holds a position
+                        # orphans that position: nothing would stop it out, scale
+                        # it out, or flatten it on a halt.
+                        old_amt = market.get_position_amt(api, cfg.symbol)
+                        if old_amt != 0:
+                            refused_cfg = new_cfg
+                            if announce:
+                                print("*** SETTINGS RELOAD REFUSED ***")
+                                print(
+                                    f"  'symbol' changed {cfg.symbol} -> {new_cfg.symbol} "
+                                    f"while {cfg.symbol} holds {old_amt}."
+                                )
+                                print(
+                                    f"  Flatten {cfg.symbol} first; switching now would leave "
+                                    "that position unsupervised. Still running on "
+                                    f"{cfg.symbol}."
+                                )
+                                journal.log_tick(
+                                    {
+                                        "action": "config_refused",
+                                        "reason": "symbol_change_with_open_position",
+                                        "current_symbol": cfg.symbol,
+                                        "rejected_symbol": new_cfg.symbol,
+                                        "position_amt": old_amt,
+                                    }
+                                )
+                        else:
+                            # Fetch into a temporary: if set_leverage below fails,
+                            # the previous symbol's filters stay in force.
+                            # Committing filters early would leave cfg on the old
+                            # symbol while sizing orders off the new symbol's lot step.
+                            new_filters = market.get_filters(api, new_cfg.symbol)
+                            market.set_leverage(api, new_cfg.symbol, new_cfg.leverage)
+                            filters = new_filters
+                            # Zone state belongs to the old symbol's ladder and
+                            # means nothing on the new one.
+                            active_index = None
+                            cfg = new_cfg
+                            halted = False
+                            refused_cfg = None
+                            print("settings reloaded")
+                    else:
+                        if new_cfg.leverage != cfg.leverage:
+                            market.set_leverage(api, new_cfg.symbol, new_cfg.leverage)
+                        cfg = new_cfg
+                        halted = False
+                        refused_cfg = None
+                        print("settings reloaded")
             except (ValueError, KeyError, OSError) as exc:
                 journal.log_tick({"action": "config_error", "error": str(exc)})
 
