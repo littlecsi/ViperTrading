@@ -49,11 +49,11 @@ def run() -> None:
     # larger than this bot would ever take, or is on the wrong side of the
     # configured trend, is somebody else's trade. Reconciling it would happen
     # silently in one market order on the first tick.
-    start_price = market.get_mark_price(api, cfg.symbol)
-    start_amt = market.get_position_amt(api, cfg.symbol)
-    start_notional = start_amt * start_price
+    start = market.get_snapshot(api, cfg.symbol)
+    start_amt = start.position_amt
+    start_notional = start_amt * start.mark_price
     start_max_n = strategy.max_notional(
-        market.get_wallet_balance(api), cfg.leverage, cfg.exposure_fraction
+        start.wallet_balance, cfg.leverage, cfg.exposure_fraction
     )
     wrong_side = (cfg.trend == settings.LONG and start_notional < 0) or (
         cfg.trend == settings.SHORT and start_notional > 0
@@ -61,7 +61,7 @@ def run() -> None:
     if wrong_side or abs(start_notional) > start_max_n:
         problem = "opposes trend" if wrong_side else "exceeds the exposure cap"
         print(f"REFUSING TO START: existing {cfg.symbol} position {problem}.")
-        print(f"  position: {start_amt} ({start_notional:.2f} USDT at {start_price})")
+        print(f"  position: {start_amt} ({start_notional:.2f} USDT at {start.mark_price})")
         print(f"  trend: {cfg.trend}, max notional this bot would hold: {start_max_n:.2f} USDT")
         print("  Flatten or reconcile that position manually, then start the bot again.")
         journal.log_tick(
@@ -181,12 +181,16 @@ def run() -> None:
             except (ValueError, KeyError, OSError) as exc:
                 journal.log_tick({"action": "config_error", "error": str(exc)})
 
-            price = market.get_mark_price(api, cfg.symbol)
-            position_amt = market.get_position_amt(api, cfg.symbol)
+            # One read per endpoint for the whole tick: price, position and
+            # balance all come from the same instant, and the tick costs 11
+            # request weight instead of 21.
+            snapshot = market.get_snapshot(api, cfg.symbol)
+            price = snapshot.mark_price
+            position_amt = snapshot.position_amt
             position_notional = position_amt * price
-            wallet = market.get_wallet_balance(api)
-            available = market.get_available_balance(api)
-            pnl = market.get_unrealized_pnl(api, cfg.symbol)
+            wallet = snapshot.wallet_balance
+            available = snapshot.available_balance
+            pnl = snapshot.unrealized_pnl
 
             decision = strategy.decide(
                 price=price,
