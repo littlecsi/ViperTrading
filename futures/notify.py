@@ -398,6 +398,33 @@ def format_config_refused(record: dict) -> str:
     return "\n".join(lines)
 
 
+def format_liquidation_brake(
+    symbol: str,
+    trend: str,
+    leverage: int,
+    survival_price: float,
+    liquidation_price: float,
+    scale: float,
+    cancelled: bool,
+) -> str:
+    """Message for the liquidation-aware brake engaging on the ladder's
+    accumulate side -- either a projected shrink or the reported-price
+    backstop cancelling outright. Worth a push the same way HALT is: an
+    operator who has walked away needs to know the bot intervened to avoid
+    liquidation even though nothing failed outright."""
+    lines = [
+        "LIQUIDATION BRAKE" + (" - CANCELLED REMAINING ORDERS" if cancelled else ""),
+        f"{symbol} {trend} {leverage}x",
+        f"liquidation price: {_num(liquidation_price)}",
+        f"survival target: {_num(survival_price)}",
+    ]
+    if not cancelled:
+        lines.append(f"accumulate-side rungs scaled to {scale * 100:.0f}% of plan")
+    lines.append("")
+    lines.append("No action needed -- the bot adjusted itself.")
+    return "\n".join(lines)
+
+
 # --- events ----------------------------------------------------------------
 #
 # What bot.py calls. One line per event at the call site, and each of them
@@ -434,3 +461,9 @@ def config_refused(record: dict) -> bool:
     """Call where bot.py announces the refusal, i.e. only when the refused
     config changed - the file is re-read and re-refused every tick."""
     return _notify(format_config_refused, record)
+
+
+def liquidation_brake(**values) -> bool:
+    """Call whenever the accumulate-side cap actually shrinks remaining
+    rungs, or the reported-liquidationPrice backstop cancels them outright."""
+    return _notify(format_liquidation_brake, **values)

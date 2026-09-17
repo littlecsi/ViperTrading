@@ -659,3 +659,34 @@ def test_startup_refusal_notifies_and_the_bot_still_refuses(monkeypatch, written
     assert len(sent) == 1
     assert sent[0].startswith("STARTUP REFUSED")
     assert "opposes the trend" in sent[0]
+
+
+def test_format_liquidation_brake_reports_a_shrink():
+    text = notify.format_liquidation_brake(
+        symbol="ETHUSDT", trend="long", leverage=5,
+        survival_price=1780.0, liquidation_price=1850.0,
+        scale=0.4, cancelled=False,
+    )
+    assert "LIQUIDATION BRAKE" in text
+    assert "1,780.00" in text
+    assert "1,850.00" in text
+    assert "40" in text  # scale shown as a percentage
+
+
+def test_format_liquidation_brake_reports_a_full_cancel():
+    text = notify.format_liquidation_brake(
+        symbol="ETHUSDT", trend="long", leverage=5,
+        survival_price=1780.0, liquidation_price=1900.0,
+        scale=0.0, cancelled=True,
+    )
+    assert "CANCELLED" in text.upper()
+
+
+def test_liquidation_brake_event_sends(sent):
+    notify.liquidation_brake(
+        symbol="ETHUSDT", trend="long", leverage=5,
+        survival_price=1780.0, liquidation_price=1850.0,
+        scale=0.4, cancelled=False,
+    )
+    assert len(sent) == 1
+    assert "LIQUIDATION BRAKE" in sent[0]
