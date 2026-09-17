@@ -8,21 +8,40 @@ from market import Filters
 F = Filters(step_size=0.001, min_qty=0.001, min_notional=20.0, tick_size=0.01)
 
 
-def test_price_for_rounds_down_to_the_nearest_tick():
-    # 2400.017 / 0.01 = 240001.7 -> floor 240001 -> 2400.01
-    assert execution.price_for(2400.017, F) == 2400.01
+def test_price_for_buy_rounds_down_to_the_nearest_tick():
+    # 2400.017 / 0.01 = 240001.7 -> floor 240001 -> 2400.01. A BUY rung sits
+    # below current price, so rounding down moves it further away from the
+    # market -- the only direction that cannot turn it marketable.
+    assert execution.price_for(2400.017, F, "BUY") == 2400.01
 
 
-def test_price_for_exact_multiple_is_unchanged():
-    assert execution.price_for(2400.05, F) == 2400.05
+def test_price_for_sell_rounds_up_to_the_nearest_tick():
+    # 2400.013 / 0.01 = 240001.3 -> ceil 240002 -> 2400.02, not down to
+    # 2400.01. A SELL rung sits above current price, so rounding DOWN would
+    # move it toward the market -- potentially turning a resting order into
+    # an unintended marketable (taker) fill. Rounding up is the mirror of
+    # BUY's floor: away from the market on both sides.
+    assert execution.price_for(2400.013, F, "SELL") == 2400.02
 
 
-def test_price_for_handles_floating_point_noise():
-    # 0.1 + 0.2 style noise must not round to an invalid tick.
-    price = 2400.00 + 0.01 * 3  # binary float noise around 2400.03
-    result = execution.price_for(price, F)
-    assert round(result / F.tick_size) == round(result / F.tick_size)  # exact multiple
-    assert result == 2400.03
+def test_price_for_exact_multiple_is_unchanged_on_both_sides():
+    assert execution.price_for(2400.05, F, "BUY") == 2400.05
+    assert execution.price_for(2400.05, F, "SELL") == 2400.05
+
+
+def test_price_for_buy_handles_floating_point_noise_below_the_tick():
+    # 2400.12 / 0.01 == 240011.99999999997 in binary float. A bare
+    # math.floor() on that raw quotient truncates to 240011 -> 2400.11, one
+    # tick too low; round(..., 8) first recovers the true 240012 -> 2400.12.
+    assert execution.price_for(2400.12, F, "BUY") == 2400.12
+
+
+def test_price_for_sell_handles_floating_point_noise_above_the_tick():
+    # 2400.00 + 0.01*3 == 240003.00000000003 in binary float. A bare
+    # math.ceil() on that raw quotient rounds up to 240004 -> 2400.04, one
+    # tick too high; round(..., 8) first recovers the true 240003 -> 2400.03.
+    price = 2400.00 + 0.01 * 3
+    assert execution.price_for(price, F, "SELL") == 2400.03
 
 
 def test_quantity_floors_to_step_size():

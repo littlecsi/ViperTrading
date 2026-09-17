@@ -32,17 +32,24 @@ def quantity_for(delta_notional: float, price: float, filters: Filters) -> float
     return round(qty, 8)
 
 
-def price_for(price: float, filters: Filters) -> float:
-    """Limit-order price floored to the exchange's tick size.
+def price_for(price: float, filters: Filters, side: str) -> float:
+    """Limit-order price rounded to the exchange's tick size, away from the
+    market on both sides.
 
-    Mirrors quantity_for()'s rounding direction and rationale: the exchange
-    rejects a price that is not an exact multiple of tickSize with -1111,
-    and floats accumulate noise that a naive round() can push onto an
-    invalid tick. Floors rather than rounds to nearest so a BUY rung never
-    creeps above its intended price (which could turn a resting order
-    marketable) and a SELL rung never creeps below (same risk, mirrored)."""
-    ticks = math.floor(round(price / filters.tick_size, 8))
-    return round(ticks * filters.tick_size, 8)
+    Mirrors quantity_for()'s rounding rationale: the exchange rejects a price
+    that is not an exact multiple of tickSize with -1111, and floats
+    accumulate noise that a naive round() can push onto an invalid tick. The
+    rounding DIRECTION must be side-aware, not a blanket floor: a BUY rung
+    sits below current price, so flooring moves it further below (away from
+    market) and can only ever be safe; a SELL rung sits above current price,
+    so flooring it would move it DOWN, toward and potentially past the
+    market, turning an intended resting order into an unintended marketable
+    (taker) fill. SELL therefore ceilings instead, moving it further above
+    (away from market) - the mirror image of BUY, both directions chosen so
+    rounding can never make a resting order more aggressive than intended."""
+    ticks = round(price / filters.tick_size, 8)
+    rounded = math.ceil(ticks) if side == "SELL" else math.floor(ticks)
+    return round(rounded * filters.tick_size, 8)
 
 
 def is_executable(qty: float, price: float, filters: Filters) -> bool:

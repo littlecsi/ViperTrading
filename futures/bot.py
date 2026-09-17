@@ -212,7 +212,7 @@ def _place_ladder(
         qty = execution.quantity_for(order.size, order.price, filters)
         if not execution.is_executable(qty, order.price, filters):
             continue
-        rounded_price = execution.price_for(order.price, filters)
+        rounded_price = execution.price_for(order.price, filters, order.side)
         result = execution.place_limit_order(api, cfg.symbol, order.side, qty, rounded_price)
         ladder_state.orders[rounded_price] = result["orderId"]
 
