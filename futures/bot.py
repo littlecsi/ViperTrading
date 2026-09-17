@@ -247,6 +247,32 @@ def _cancel_ladder(api, cfg, ladder_state) -> None:
     ladder_state.reset()
 
 
+def _detect_fill(api, cfg, ladder_state) -> tuple:
+    """The tracked rungs that are no longer resting on the book.
+
+    There is no fill event to subscribe to: the open orders are polled and
+    diffed against the tracked rung->id map, so a tracked id the exchange no
+    longer reports as open is a rung that filled - or one cancelled out from
+    under the bot, which needs the same reconciliation either way. Poll-based,
+    so detection is up to one poll_seconds late (design doc, "Risk notes"); a
+    user data stream would be immediate at the cost of a persistent connection,
+    listen-key keepalive and reconnect logic this codebase carries nowhere.
+
+    ladder_state.orders is keyed by the TICK-ROUNDED price actually sent to the
+    exchange (execution.price_for), not the theoretical rung price - but only
+    the values are used here, so the diff is on ids alone and cannot be thrown
+    off by a rounding difference.
+
+    Nothing tracked means no ladder to diff, and the exchange is not asked at
+    all: this runs on every tick a ladder is live, and the tick is not paying a
+    REST call to be told about orders it never placed."""
+    if not ladder_state.orders:
+        return ()
+    open_ids = {o["orderId"] for o in market.get_open_orders(api, cfg.symbol)}
+    tracked_ids = set(ladder_state.orders.values())
+    return tuple(tracked_ids - open_ids)
+
+
 def _notify_cancel_failure(message, symbol) -> None:
     """Push a failed exit-path ladder cancel - AFTER the flatten, never before.
 
@@ -697,6 +723,23 @@ def run() -> None:
                         _place_ladder(
                             api, cfg, decision.zone_index, price, decision.max_n,
                             filters, leverage_brackets, ladder_state,
+                        )
+                    elif _detect_fill(api, cfg, ladder_state):
+                        # A rung filled, so the ladder no longer matches the
+                        # position - but this tick does NOTHING about it beyond
+                        # starting the wait. A fill that moved price through one
+                        # rung is quite likely to move it through the next, and
+                        # reconciling mid-cascade would cancel and replace rungs
+                        # against a position already out of date, once per poll,
+                        # while the move is still running. So the open-order set
+                        # is snapshotted instead, and reconciliation waits for a
+                        # tick that finds it unchanged - the market having
+                        # stopped moving through the ladder. A further fill
+                        # before then simply lands here again and re-snapshots,
+                        # restarting the wait.
+                        ladder_state.settling = True
+                        ladder_state.settling_snapshot = frozenset(
+                            o["orderId"] for o in market.get_open_orders(api, cfg.symbol)
                         )
                 finally:
                     # active_index advances even if placement raised partway

@@ -216,7 +216,8 @@ class LoopClient:
     """Enough of UMFutures for one trip round bot.run()."""
 
     def __init__(self, price="2700.00", balance="0.0", order_error=None, margin_type_error=None,
-                 price_schedule=None, position="0.0", cancel_error=None):
+                 price_schedule=None, position="0.0", cancel_error=None,
+                 open_orders_after_tick=None):
         self.price = price
         # {ticker_price call number: new price}. bot.run() has no supported
         # pause/resume, so walking price across a zone boundary inside ONE
@@ -231,6 +232,13 @@ class LoopClient:
         self.margin_type_error = margin_type_error
         self.orders = 0
         self.placed_orders = []
+        # Every LIMIT order this client accepted and has not since taken off
+        # the book, as the exchange would report them. {loop tick: [ids that
+        # survive it]} removes rungs at a chosen tick, which is how a FILL is
+        # simulated: to the bot a filled rung is simply one that stopped being
+        # open.
+        self.open_orders_after_tick = open_orders_after_tick or {}
+        self._open_orders = []
         self.cancelled = []  # one symbol per cancel_open_orders call
         self.events = []  # ("place", type) / ("cancel", symbol), in call order
         self.margin_type_calls = []
@@ -271,10 +279,20 @@ class LoopClient:
             "liquidationPrice": "0.0", "entryPrice": "0.0", "isolatedWallet": "0.0",
         }]
 
+    @property
+    def _tick(self):
+        """Which loop tick this call falls in. get_snapshot reads ticker_price
+        first thing every tick, and call 1 is run()'s startup read, so loop
+        tick N is price read N + 1."""
+        return self.price_reads - 1
+
     def get_orders(self, symbol):
         # market.get_open_orders calls the connector's plural `get_orders`
         # (GET /fapi/v1/openOrders), not the singular `get_open_order`.
-        return []
+        if self._tick in self.open_orders_after_tick:
+            keep = self.open_orders_after_tick[self._tick]
+            self._open_orders = [o for o in self._open_orders if o["orderId"] in keep]
+        return list(self._open_orders)
 
     # Deliberately NO cancel_order: the ladder teardown must take the whole
     # symbol off the book in one request, so a regression to the per-id loop
@@ -285,7 +303,10 @@ class LoopClient:
         if self.cancel_error is not None:
             error = self.cancel_error(len(self.cancelled))
             if error:
+                # A cancel that failed took nothing off the book, so the rungs
+                # stay open - which is what makes the retry path testable.
                 raise error
+        self._open_orders = []
         return {"code": 200, "msg": "The operation of cancel all open order is done."}
 
     def new_order(self, **params):
@@ -299,6 +320,12 @@ class LoopClient:
             if message:
                 raise RuntimeError(message)
         if params.get("type") == "LIMIT":
+            self._open_orders.append({
+                "orderId": self.orders,
+                "side": params["side"],
+                "price": str(params["price"]),
+                "origQty": str(params["quantity"]),
+            })
             return {"orderId": self.orders, "status": "NEW"}
         return {"orderId": self.orders, "avgPrice": "0", "executedQty": "0", "cumQuote": "0"}
 
@@ -542,6 +569,64 @@ def test_a_fully_rejected_ladder_still_retries_next_tick(monkeypatch, written):
     run_loop(monkeypatch, written, ticks=10, api=api)
 
     assert api.orders == 10  # one attempt per tick, still trying
+
+
+# --- a filled rung is detected by polling the open orders ------------------
+#
+# There is no fill event to subscribe to here: the bot polls its open orders
+# and calls a tracked rung that has stopped being open a fill (see the design
+# doc's "Risk notes" - detection is up to one poll_seconds late). Detection
+# alone changes nothing on the book; it only starts the settling wait, which
+# is what stops the ladder being reconciled against a position that is still
+# moving.
+
+
+class FakeLadderState:
+    def __init__(self, orders):
+        self.orders = orders
+
+
+def test_detect_fill_reports_tracked_rungs_that_are_no_longer_open(monkeypatch):
+    api = LoopClient()
+    api._open_orders = [{"orderId": 2}, {"orderId": 3}]
+    cfg = bot.settings.load()
+
+    # Keys are the tick-ROUNDED rung prices execution.price_for produced, which
+    # is what the exchange has; the values are the ids the diff works on.
+    state = FakeLadderState({2499.5: 1, 2450.0: 2, 2400.0: 3})
+    assert bot._detect_fill(api, cfg, state) == (1,)
+
+    # Nothing missing, and nothing tracked at all: both are "no fill", and the
+    # second must not even ask the exchange.
+    assert bot._detect_fill(api, cfg, FakeLadderState({2450.0: 2, 2400.0: 3})) == ()
+    api.get_orders = lambda symbol: pytest.fail("no ladder tracked: must not poll")
+    assert bot._detect_fill(api, cfg, FakeLadderState({})) == ()
+
+
+def test_a_filled_rung_enters_settling_without_reconciling_the_same_tick(monkeypatch, written):
+    """A fill is the trigger for the settling wait, not for reconciliation.
+
+    Reconciling on the fill tick would rebuild the ladder against a position
+    that may still be filling - a fast move through several rungs would have
+    the bot cancelling and replacing rungs mid-cascade, each pass priced off a
+    position already out of date. So the tick that SEES the fill does nothing
+    to the book; it takes a snapshot and waits for a tick that confirms the
+    open-order set has stopped changing."""
+    control = LoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, written, ticks=1, api=control)
+    all_ids = [o["orderId"] for o in control._open_orders]
+    assert len(all_ids) > 1
+    filled = all_ids[0]
+
+    api = LoopClient(
+        price="2500.00", balance="1000.0",
+        open_orders_after_tick={2: [i for i in all_ids if i != filled]},
+    )
+    run_loop(monkeypatch, written, ticks=2, api=api)
+
+    assert filled not in [o["orderId"] for o in api._open_orders]  # it really filled
+    assert api.cancelled == []  # nothing pulled off the book
+    assert api.orders == control.orders  # and nothing replaced, this tick
 
 
 # --- the ladder comes off the book when its zone is left -------------------
