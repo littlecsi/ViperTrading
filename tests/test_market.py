@@ -207,7 +207,7 @@ class LadderFakeClient:
         self.leverage_bracket_calls = []
         self.margin_type_calls = []
 
-    def get_open_orders(self, symbol):
+    def get_orders(self, symbol):
         self.open_orders_calls.append(symbol)
         return [{"symbol": symbol, "orderId": 1, "side": "BUY", "price": "2400.00"}]
 

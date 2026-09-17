@@ -192,8 +192,14 @@ def set_leverage(client, symbol: str, leverage: int) -> None:
 def get_open_orders(client, symbol: str) -> list[dict]:
     """Every open order on `symbol`. Polled each tick a ladder is live to
     detect fills by diffing against the tracked rung order-id map -- see
-    bot.py and the design doc's "Rate limits" section for the added cost."""
-    return client.get_open_orders(symbol=symbol)
+    bot.py and the design doc's "Rate limits" section for the added cost.
+
+    Calls the connector's `get_orders` (plural `GET /fapi/v1/openOrders`),
+    not `get_open_orders` (singular `GET /fapi/v1/openOrder`) -- the latter
+    requires an `orderId` or `origClientOrderId` and raises
+    `ParameterRequiredError` when given neither, so it cannot answer "every
+    open order on this symbol"."""
+    return client.get_orders(symbol=symbol)
 
 
 def get_leverage_brackets(client, symbol: str) -> list[dict]:
