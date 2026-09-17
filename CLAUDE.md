@@ -35,11 +35,16 @@ The active system lives in `futures/`:
   (one line per record the loop hands it — a repeated state is written at most once per interval, see
   architecture notes below; `journal.py` writes, it does not decide) and `orders-YYYY-MM-DD.jsonl` (one
   line per executed order, carrying a full environment snapshot at fill time).
+- `futures/notify.py` — Telegram push notifications: `enabled()`, `send()`, one pure formatter per
+  event (`format_order`, `format_halt`, `format_startup_refused`, `format_config_refused`) and the
+  event entry points `bot.py` calls (`order_executed`, `halt`, `startup_refused`, `config_refused`).
+  Formatting and sending only — no trading logic, no decisions. Every entry point returns a bool and
+  swallows `Exception`, so a notification failure can never reach the loop; see architecture notes.
 - `futures/bot.py` — the polling loop (entry point). Owns only five pieces of mutable state across
   iterations: `active_index` (which zone is currently being worked), `halted` (whether the
-  HALT-left-the-ladder notice has already been printed), `refused_cfg` (the settings edit whose reload
-  was last refused), and one `TickLog` per journal record stream — `tick_log`, `config_log`,
-  `error_log`.
+  HALT-left-the-ladder notice has already been announced, and re-armed once price returns to the
+  ladder), `refused_cfg` (the settings edit whose reload was last refused), and one `TickLog` per
+  journal record stream — `tick_log`, `config_log`, `error_log`.
 
 `binance/` (`binance/main.py`, `binance/biat.py`) is the **legacy Spot bot** — a volatility-breakout
 strategy for Spot XRP/USDT with Slack alerting. It is retained for reference but is **out of scope and
@@ -59,6 +64,11 @@ A `futures/config.py` module is required at runtime but is not checked into the 
 It must define four names:
 - `api_key`, `api_secret` — live Binance Futures API credentials
 - `testnet_key`, `testnet_secret` — separate Binance Futures **testnet** API credentials
+
+It may also define two optional names:
+- `telegram_token`, `telegram_chat_id` — the bot token and chat id `notify.py` posts to. Both missing
+  or empty means notifications are simply off; that is a supported state, not an error, and it must
+  stay silent rather than warn.
 
 Live and testnet credentials are entirely separate and not interchangeable; `client.build(testnet)`
 picks the pair to use based on the `testnet` flag in `settings.json`.
@@ -136,6 +146,20 @@ collection.
   carrying the changed fields as `{field: [old, new]}`). Under the throttle the next tick record can be
   up to a minute away, so without this the journal cannot say when an edit actually took effect. It is
   the counterpart to `config_refused`; keep both.
+- **Telegram notifications may never affect trading** (`futures/notify.py`). Four events are pushed:
+  every executed order (never throttled — fills are rare and each moves real money), the transition
+  into `HALT`, `startup_refused`, and `config_refused`. Three rules hold this together. (1) *It cannot
+  raise into the loop*: `send()` and every event entry point swallow `Exception` and return a bool, and
+  the failure path is itself guarded and forced to ASCII — an f-string of a localised `OSError` on a
+  `cp949` console is how the bot was killed once before. (2) *It cannot stall the loop*: every request
+  carries an explicit `notify.TIMEOUT_SECONDS` timeout; there is deliberately no thread and no queue.
+  (3) *It disappears when unconfigured*: credentials are read with `getattr(config, ..., None)`, and
+  absent or empty means silently off — no warning, no log line. Notifications are sent **after** the
+  corresponding journal write and formatted from the same record, so a Telegram problem can never cost
+  an order-journal line and the message can never disagree with the audit trail. Sticky states notify
+  on the transition, reusing the loop state that already exists for that (`halted` for `HALT`, the
+  `announce`/`refused_cfg` dedupe for `config_refused`) rather than adding a second throttle — note
+  `TickLog` is not reusable here, it writes to `journal.log_tick` itself.
 - **Order quantities floor to the lot step, never round up** (`execution.quantity_for` uses
   `math.floor`). Rounding up would let the bot exceed its own exposure cap on the last partial step of a
   fill — flooring is the only direction that cannot overshoot.
@@ -163,5 +187,5 @@ collection.
   to every subsequent timestamp.
 - `bot.py` holds the loop's mutable state — `active_index`, `halted`, `refused_cfg`, and the
   `tick_log`/`config_log`/`error_log` `TickLog` instances; `market.py`, `strategy.py`, `execution.py`,
-  and `journal.py` are stateless and take all inputs as arguments — don't reintroduce module-level
-  mutable state into them.
+  `journal.py`, and `notify.py` are stateless and take all inputs as arguments — don't reintroduce
+  module-level mutable state into them.

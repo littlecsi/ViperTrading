@@ -6,6 +6,7 @@ import client
 import execution
 import journal
 import market
+import notify
 import settings
 import strategy
 
@@ -174,19 +175,21 @@ def run() -> None:
         print(f"  position: {start_amt} ({start_notional:.2f} USDT at {start.mark_price})")
         print(f"  trend: {cfg.trend}, max notional this bot would hold: {start_max_n:.2f} USDT")
         print("  Flatten or reconcile that position manually, then start the bot again.")
-        journal.log_tick(
-            {
-                "action": "startup_refused",
-                "reason": "unreconciled_position",
-                "symbol": cfg.symbol,
-                "testnet": cfg.testnet,
-                "position_amt": start_amt,
-                "current_notional": start_notional,
-                "max_notional": start_max_n,
-                "trend": cfg.trend,
-                "wrong_side": wrong_side,
-            }
-        )
+        refusal = {
+            "action": "startup_refused",
+            "reason": "unreconciled_position",
+            "symbol": cfg.symbol,
+            "testnet": cfg.testnet,
+            "position_amt": start_amt,
+            "current_notional": start_notional,
+            "max_notional": start_max_n,
+            "trend": cfg.trend,
+            "wrong_side": wrong_side,
+        }
+        journal.log_tick(refusal)
+        # Notified from the same dict, and after the journal write: a Telegram
+        # problem must never cost the record. notify cannot raise.
+        notify.startup_refused(refusal)
         return
 
     active_index = None
@@ -233,14 +236,14 @@ def run() -> None:
                                 f"  The bot is STILL RUNNING on {label} with the previous "
                                 "settings. No part of the new file was applied."
                             )
-                            journal.log_tick(
-                                {
-                                    "action": "config_refused",
-                                    "reason": "testnet_change_requires_restart",
-                                    "current_testnet": cfg.testnet,
-                                    "rejected_testnet": new_cfg.testnet,
-                                }
-                            )
+                            refusal = {
+                                "action": "config_refused",
+                                "reason": "testnet_change_requires_restart",
+                                "current_testnet": cfg.testnet,
+                                "rejected_testnet": new_cfg.testnet,
+                            }
+                            journal.log_tick(refusal)
+                            notify.config_refused(refusal)
                     elif new_cfg.symbol != cfg.symbol:
                         # Adopting a new symbol while the old one holds a position
                         # orphans that position: nothing would stop it out, scale
@@ -259,15 +262,15 @@ def run() -> None:
                                     "that position unsupervised. Still running on "
                                     f"{cfg.symbol}."
                                 )
-                                journal.log_tick(
-                                    {
-                                        "action": "config_refused",
-                                        "reason": "symbol_change_with_open_position",
-                                        "current_symbol": cfg.symbol,
-                                        "rejected_symbol": new_cfg.symbol,
-                                        "position_amt": old_amt,
-                                    }
-                                )
+                                refusal = {
+                                    "action": "config_refused",
+                                    "reason": "symbol_change_with_open_position",
+                                    "current_symbol": cfg.symbol,
+                                    "rejected_symbol": new_cfg.symbol,
+                                    "position_amt": old_amt,
+                                }
+                                journal.log_tick(refusal)
+                                notify.config_refused(refusal)
                         else:
                             # Fetch into a temporary: if set_leverage below fails,
                             # the previous symbol's filters stay in force.
@@ -350,6 +353,14 @@ def run() -> None:
 
             zone = cfg.zones[decision.zone_index] if decision.zone_index is not None else None
 
+            # Re-arm the halt announcement whenever price is back on the
+            # ladder. `halted` is what makes HALT announced on the transition
+            # into it rather than once per poll for as long as it lasts, but
+            # left latched it also silences the NEXT departure - the one that
+            # happens after price recovered and the bot took a fresh position.
+            if decision.action != strategy.HALT:
+                halted = False
+
             # Whether this tick actually sends an order decides whether its
             # record survives the throttle, so the sizing check - pure
             # arithmetic, no I/O - runs before the journal write. The record
@@ -391,6 +402,20 @@ def run() -> None:
             if decision.action == strategy.HALT and not halted:
                 print(f"HALT - price {price} left the zone ladder")
                 halted = True
+                # On the transition only, and after this tick's journal write.
+                # Sent before the flattening order rather than after it: if
+                # execute() raises, the halt is still the thing the operator
+                # most needs to hear about, and by then `halted` would have
+                # latched and no later tick would say it.
+                notify.halt(
+                    symbol=cfg.symbol,
+                    price=price,
+                    trend=cfg.trend,
+                    leverage=cfg.leverage,
+                    position_amt=position_amt,
+                    position_notional=position_notional,
+                    flattening=sending,
+                )
 
             if not sending:
                 active_index = decision.zone_index
@@ -430,39 +455,42 @@ def run() -> None:
                 # the fields are present and null so the gap is explicit.
                 fill = execution.fill_from_response(result)
 
-                journal.log_order(
-                    {
-                        "order_id": result.get("orderId"),
-                        "client_order_id": result.get("clientOrderId"),
-                        "symbol": cfg.symbol,
-                        "side": side,
-                        "reason": decision.reason,
-                        "quantity": qty,
-                        "executed_qty": fill.qty,
-                        "fill_price": fill.price,
-                        "notional": fill.notional,
-                        "commission": None,
-                        "commission_asset": None,
-                        "reduce_only": reduce_only,
-                        "mark_price": price,
-                        "trend": cfg.trend,
-                        "leverage": cfg.leverage,
-                        "alpha": cfg.alpha,
-                        "exposure_fraction": cfg.exposure_fraction,
-                        "active_zone_index": decision.zone_index,
-                        "support": zone.support if zone else None,
-                        "resistance": zone.resistance if zone else None,
-                        "d": decision.d,
-                        "max_notional": decision.max_n,
-                        "target_notional": decision.target_signed,
-                        "position_before": position_amt,
-                        "position_after": position_after,
-                        "balance": wallet,
-                        "available_balance": available,
-                        "unrealized_pnl": pnl,
-                    }
-                )
+                record = {
+                    "order_id": result.get("orderId"),
+                    "client_order_id": result.get("clientOrderId"),
+                    "symbol": cfg.symbol,
+                    "side": side,
+                    "reason": decision.reason,
+                    "quantity": qty,
+                    "executed_qty": fill.qty,
+                    "fill_price": fill.price,
+                    "notional": fill.notional,
+                    "commission": None,
+                    "commission_asset": None,
+                    "reduce_only": reduce_only,
+                    "mark_price": price,
+                    "trend": cfg.trend,
+                    "leverage": cfg.leverage,
+                    "alpha": cfg.alpha,
+                    "exposure_fraction": cfg.exposure_fraction,
+                    "active_zone_index": decision.zone_index,
+                    "support": zone.support if zone else None,
+                    "resistance": zone.resistance if zone else None,
+                    "d": decision.d,
+                    "max_notional": decision.max_n,
+                    "target_notional": decision.target_signed,
+                    "position_before": position_amt,
+                    "position_after": position_after,
+                    "balance": wallet,
+                    "available_balance": available,
+                    "unrealized_pnl": pnl,
+                }
+                journal.log_order(record)
                 print(f"{side} {qty} {cfg.symbol} @ ~{price} ({decision.reason})")
+                # Journal first, then Telegram, and from the same record: a
+                # notification problem can never cost an order-journal line.
+                # Never throttled - every fill moves real money.
+                notify.order_executed(record)
             finally:
                 active_index = decision.zone_index
 
