@@ -1,11 +1,46 @@
 from dataclasses import dataclass
 
+from binance.error import ClientError
+
 
 @dataclass(frozen=True)
 class Filters:
     step_size: float
     min_qty: float
     min_notional: float
+
+
+@dataclass(frozen=True)
+class MarginTier:
+    """One row of Binance's per-symbol maintenance-margin bracket table."""
+    floor: float
+    cap: float
+    maint_margin_rate: float
+    maint_amount: float
+
+
+def maintenance_tier_from(brackets: list[dict], notional: float) -> MarginTier:
+    """The bracket whose [notionalFloor, notionalCap) contains `notional`.
+
+    A notional beyond every bracket's cap uses the highest tier as the most
+    conservative approximation -- Binance's tiers only ever increase the
+    maintenance margin rate at higher notional, so this over- rather than
+    under-estimates risk."""
+    for b in brackets:
+        floor = float(b["notionalFloor"])
+        cap = float(b["notionalCap"])
+        if floor <= notional < cap:
+            return MarginTier(
+                floor=floor, cap=cap,
+                maint_margin_rate=float(b["maintMarginRatio"]),
+                maint_amount=float(b["cum"]),
+            )
+    last = brackets[-1]
+    return MarginTier(
+        floor=float(last["notionalFloor"]), cap=float(last["notionalCap"]),
+        maint_margin_rate=float(last["maintMarginRatio"]),
+        maint_amount=float(last["cum"]),
+    )
 
 
 def get_filters(client, symbol: str) -> Filters:
@@ -152,3 +187,38 @@ def get_position_amt(client, symbol: str) -> float:
 
 def set_leverage(client, symbol: str, leverage: int) -> None:
     client.change_leverage(symbol=symbol, leverage=leverage)
+
+
+def get_open_orders(client, symbol: str) -> list[dict]:
+    """Every open order on `symbol`. Polled each tick a ladder is live to
+    detect fills by diffing against the tracked rung order-id map -- see
+    bot.py and the design doc's "Rate limits" section for the added cost."""
+    return client.get_open_orders(symbol=symbol)
+
+
+def get_leverage_brackets(client, symbol: str) -> list[dict]:
+    """The maintenance-margin bracket table for `symbol`. Fetched once at
+    startup/symbol-switch and cached by bot.py -- this table changes rarely,
+    unlike position state."""
+    response = client.leverage_brackets(symbol=symbol)
+    return response[0]["brackets"]
+
+
+def set_margin_type(client, symbol: str, margin_type: str = "ISOLATED") -> str:
+    """Set margin type, tolerating the two expected rejections.
+
+    -4046 means the account is already in the requested mode - a no-op.
+    -4047 means a position is already open on the symbol; margin mode can
+    only change while flat. That is reported to the caller rather than
+    retried here: bot.py logs a warning and keeps running rather than
+    refusing to start, per the design doc's "Margin mode" section - this is
+    a risk-profile setting, not a correctness invariant."""
+    try:
+        client.change_margin_type(symbol=symbol, marginType=margin_type)
+        return "changed"
+    except ClientError as exc:
+        if exc.error_code == -4046:
+            return "already_set"
+        if exc.error_code == -4047:
+            return "position_open"
+        raise

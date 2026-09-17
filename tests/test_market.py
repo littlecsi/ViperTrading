@@ -1,5 +1,7 @@
 import pytest
 
+from binance.error import ClientError
+
 import market
 
 
@@ -169,3 +171,89 @@ def test_entry_price_from():
 
 def test_isolated_wallet_from():
     assert market.isolated_wallet_from(POSITIONS, "ETHUSDT") == 600.00
+
+
+BRACKETS = [
+    {"bracket": 1, "initialLeverage": 20, "notionalCap": 50000.0, "notionalFloor": 0.0,
+     "maintMarginRatio": 0.01, "cum": 0.0},
+    {"bracket": 2, "initialLeverage": 10, "notionalCap": 250000.0, "notionalFloor": 50000.0,
+     "maintMarginRatio": 0.025, "cum": 750.0},
+]
+
+
+def test_maintenance_tier_from_finds_matching_bracket():
+    tier = market.maintenance_tier_from(BRACKETS, 30000.0)
+    assert tier.maint_margin_rate == 0.01
+    assert tier.maint_amount == 0.0
+    assert tier.floor == 0.0
+    assert tier.cap == 50000.0
+
+
+def test_maintenance_tier_from_finds_second_bracket():
+    tier = market.maintenance_tier_from(BRACKETS, 100000.0)
+    assert tier.maint_margin_rate == 0.025
+    assert tier.maint_amount == 750.0
+
+
+def test_maintenance_tier_from_notional_beyond_every_cap_uses_highest_tier():
+    tier = market.maintenance_tier_from(BRACKETS, 999999.0)
+    assert tier.maint_margin_rate == 0.025
+
+
+class LadderFakeClient:
+    def __init__(self, margin_type_error: ClientError | None = None):
+        self.margin_type_error = margin_type_error
+        self.open_orders_calls = []
+        self.leverage_bracket_calls = []
+        self.margin_type_calls = []
+
+    def get_open_orders(self, symbol):
+        self.open_orders_calls.append(symbol)
+        return [{"symbol": symbol, "orderId": 1, "side": "BUY", "price": "2400.00"}]
+
+    def leverage_brackets(self, symbol=None):
+        self.leverage_bracket_calls.append(symbol)
+        return [{"symbol": symbol, "brackets": BRACKETS}]
+
+    def change_margin_type(self, symbol, marginType):
+        self.margin_type_calls.append((symbol, marginType))
+        if self.margin_type_error is not None:
+            raise self.margin_type_error
+
+
+def test_get_open_orders_calls_client():
+    c = LadderFakeClient()
+    orders = market.get_open_orders(c, "ETHUSDT")
+    assert c.open_orders_calls == ["ETHUSDT"]
+    assert orders[0]["orderId"] == 1
+
+
+def test_get_leverage_brackets_unwraps_single_symbol_response():
+    c = LadderFakeClient()
+    brackets = market.get_leverage_brackets(c, "ETHUSDT")
+    assert brackets == BRACKETS
+    assert c.leverage_bracket_calls == ["ETHUSDT"]
+
+
+def test_set_margin_type_changed():
+    c = LadderFakeClient()
+    assert market.set_margin_type(c, "ETHUSDT") == "changed"
+    assert c.margin_type_calls == [("ETHUSDT", "ISOLATED")]
+
+
+def test_set_margin_type_already_set_is_a_no_op():
+    c = LadderFakeClient(margin_type_error=ClientError(400, -4046, "No need to change margin type.", {}))
+    assert market.set_margin_type(c, "ETHUSDT") == "already_set"
+
+
+def test_set_margin_type_position_open_is_reported_not_raised():
+    c = LadderFakeClient(
+        margin_type_error=ClientError(400, -4047, "Margin type cannot be changed if there exists position.", {})
+    )
+    assert market.set_margin_type(c, "ETHUSDT") == "position_open"
+
+
+def test_set_margin_type_other_errors_raise():
+    c = LadderFakeClient(margin_type_error=ClientError(400, -1021, "Timestamp for this request is outside of the recvWindow.", {}))
+    with pytest.raises(ClientError):
+        market.set_margin_type(c, "ETHUSDT")
