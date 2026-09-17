@@ -161,6 +161,15 @@ def liquidation_scale(
 
     def liquidation_price(k: float) -> float:
         qty = position_qty + k * planned_delta_qty
+        if qty == 0:
+            # A zero position cannot be liquidated, so there is nothing to
+            # guard at this k: report a liquidation price infinitely far in
+            # the adverse direction, which safe() then reads as safe. This is
+            # reachable in normal operation -- a round trip back to flat
+            # inside an active zone re-enters with position_qty == 0, and the
+            # k=0 endpoint is evaluated whenever k=1 is not already safe --
+            # and the only alternative here is dividing by zero.
+            return float("-inf") if trend == LONG else float("inf")
         added_wallet = k * planned_delta_notional / leverage
         cost_basis = entry_price * position_qty + k * planned_delta_notional
         if trend == LONG:
@@ -189,8 +198,15 @@ def liquidation_scale(
         b = planned_delta_notional * (1 + 1 / leverage)
         c = survival_price * (1 + mmr)
 
-    k = (c * position_qty - a) / (b - c * planned_delta_qty)
-    return max(0.0, min(1.0, k))
+    denominator = b - c * planned_delta_qty
+    if denominator == 0:
+        # Safety reduces to the linear test (a - c*position_qty) + denominator
+        # * k <= 0, so a zero denominator makes it independent of k -- which
+        # the endpoint checks above would already have caught, EXCEPT when
+        # position_qty == 0 put a discontinuity at k=0 (flat is trivially
+        # safe, nothing above it is). Nothing beyond zero is safe there.
+        return 0.0
+    return max(0.0, min(1.0, (c * position_qty - a) / denominator))
 
 
 def survival_price(

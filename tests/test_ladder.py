@@ -205,3 +205,51 @@ def test_apply_liquidation_cap_shrinks_only_the_accumulate_side():
             assert adjusted.size == pytest.approx(original.size * 0.5)
         else:
             assert adjusted.size == original.size
+
+
+def test_liquidation_scale_flat_position_is_not_a_division_by_zero():
+    # A round trip back to flat inside an active zone re-enters here with
+    # position_qty=0. k=1 is unsafe (LiqPrice(1) = 1720/19 = 90.53 > 85), so
+    # the k=0 endpoint IS evaluated -- and qty is exactly 0 there.
+    k = ladder.liquidation_scale(
+        position_qty=0, entry_price=100, isolated_wallet=0, leverage=20,
+        tier=TIER, survival_price=85, planned_delta_qty=20,
+        planned_delta_notional=1800, trend=LONG,
+    )
+    assert k == 0.0
+
+
+def test_liquidation_scale_flat_position_still_allows_a_safe_full_plan():
+    # Same flat position, loose survival target: nothing to cap.
+    k = ladder.liquidation_scale(
+        position_qty=0, entry_price=100, isolated_wallet=0, leverage=20,
+        tier=TIER, survival_price=95, planned_delta_qty=20,
+        planned_delta_notional=1800, trend=LONG,
+    )
+    assert k == 1.0
+
+
+def test_liquidation_scale_flat_position_with_degenerate_denominator_returns_zero():
+    # survival=90 makes c*delta_qty == b exactly (85.5*20 == 1710), so the
+    # closed form's denominator is 0. With a flat position no k > 0 is safe.
+    k = ladder.liquidation_scale(
+        position_qty=0, entry_price=100, isolated_wallet=0, leverage=20,
+        tier=TIER, survival_price=90, planned_delta_qty=20,
+        planned_delta_notional=1800, trend=LONG,
+    )
+    assert k == 0.0
+
+
+def test_liquidation_scale_flat_position_with_leftover_margin_finds_the_root():
+    # Flat but carrying isolated wallet above maint_amount: the safe set is a
+    # real interval (0, k*], and k* must land on the survival price exactly.
+    k = ladder.liquidation_scale(
+        position_qty=0, entry_price=100, isolated_wallet=20, leverage=20,
+        tier=TIER, survival_price=85, planned_delta_qty=20,
+        planned_delta_notional=1800, trend=LONG,
+    )
+    qty = k * 20
+    wallet = 20 + k * 1800 / 20
+    cost_basis = k * 1800
+    liq_price = (cost_basis - wallet + TIER.maint_amount) / (qty * (1 - TIER.maint_margin_rate))
+    assert liq_price == pytest.approx(85.0)
