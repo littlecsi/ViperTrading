@@ -126,3 +126,114 @@ def desired_orders(
         DesiredOrder(price=rung.price, side=side_for(rung.price, current_price, trend), size=rung.size)
         for rung in build_rung_orders(zone, trend, max_n, alpha, rung_spacing_pct)
     )
+
+
+def liquidation_scale(
+    position_qty: float,
+    entry_price: float,
+    isolated_wallet: float,
+    leverage: int,
+    tier,  # market.MarginTier
+    survival_price: float,
+    planned_delta_qty: float,
+    planned_delta_notional: float,
+    trend: str,
+) -> float:
+    """Safety factor k in [0, 1] to scale the remaining accumulate-side
+    rungs by, so that filling ALL of them at their planned (unscaled) sizes
+    would not push the projected liquidation price past survival_price.
+
+    Uses Binance's documented isolated-margin liquidation formula (single
+    position, one-way mode); adding delta_qty at price p is modelled as also
+    adding delta_qty*p/leverage of fresh isolated margin, matching how
+    Binance funds an added fill at a fixed leverage. Safety is evaluated at
+    the two endpoints k=0 and k=1 FIRST rather than solving and clamping:
+    the liquidation price is a ratio in k whose pole can sit outside [0, 1],
+    which would put the raw algebraic root on the wrong side of the
+    interval. Only in the sub-case where the endpoints disagree is the
+    closed-form crossing point used, and there the intermediate value
+    theorem guarantees it lands inside (0, 1). k=1 means the full planned
+    accumulation is safe as-is; k=0 means even the smallest further
+    accumulation is unsafe. See the design doc's "Liquidation-aware buy-side
+    cap"."""
+    mmr = tier.maint_margin_rate
+    maint_amount = tier.maint_amount
+
+    def liquidation_price(k: float) -> float:
+        qty = position_qty + k * planned_delta_qty
+        added_wallet = k * planned_delta_notional / leverage
+        cost_basis = entry_price * position_qty + k * planned_delta_notional
+        if trend == LONG:
+            numerator = cost_basis - (isolated_wallet + added_wallet) + maint_amount
+            return numerator / (qty * (1 - mmr))
+        numerator = cost_basis + (isolated_wallet + added_wallet) - maint_amount
+        return numerator / (qty * (1 + mmr))
+
+    def safe(price: float) -> bool:
+        return price <= survival_price if trend == LONG else price >= survival_price
+
+    if safe(liquidation_price(1.0)):
+        return 1.0
+    if not safe(liquidation_price(0.0)):
+        return 0.0
+
+    # Safety is monotonic and continuous between k=0 (safe) and k=1 (unsafe)
+    # -- no pole in this range since qty stays positive throughout -- so the
+    # closed-form crossing point is guaranteed to land in (0, 1).
+    if trend == LONG:
+        a = entry_price * position_qty - isolated_wallet + maint_amount
+        b = planned_delta_notional * (1 - 1 / leverage)
+        c = survival_price * (1 - mmr)
+    else:
+        a = entry_price * position_qty + isolated_wallet - maint_amount
+        b = planned_delta_notional * (1 + 1 / leverage)
+        c = survival_price * (1 + mmr)
+
+    k = (c * position_qty - a) / (b - c * planned_delta_qty)
+    return max(0.0, min(1.0, k))
+
+
+def survival_price(
+    zones: tuple[Zone, ...],
+    active_index: int,
+    trend: str,
+    liquidation_buffer_pct: float,
+) -> float:
+    """The price the position must survive to without liquidating.
+
+    Zones are contiguous and ordered highest-to-lowest (settings.py already
+    enforces zones[i].support == zones[i+1].resistance), so for LONG the
+    next-lower zone is at active_index + 1. At the ladder's lowest zone
+    (LONG) or highest zone (SHORT), where there is no next zone in that
+    direction, the same buffer percentage is applied to the active zone's
+    own span instead. See design doc "Liquidation-aware buy-side cap"."""
+    active = zones[active_index]
+    if trend == LONG:
+        if active_index + 1 < len(zones):
+            next_zone = zones[active_index + 1]
+            span = next_zone.resistance - next_zone.support
+            return next_zone.resistance - liquidation_buffer_pct * span
+        span = active.resistance - active.support
+        return active.support - liquidation_buffer_pct * span
+    else:
+        if active_index - 1 >= 0:
+            next_zone = zones[active_index - 1]
+            span = next_zone.resistance - next_zone.support
+            return next_zone.support + liquidation_buffer_pct * span
+        span = active.resistance - active.support
+        return active.resistance + liquidation_buffer_pct * span
+
+
+def apply_liquidation_cap(
+    orders: tuple[DesiredOrder, ...], scale: float, trend: str
+) -> tuple[DesiredOrder, ...]:
+    """Scale down only the accumulate-side orders (BUY for long, SELL for
+    short) by `scale`; the trim side is untouched. `scale` comes from
+    liquidation_scale()."""
+    accumulate_side = "BUY" if trend == LONG else "SELL"
+    return tuple(
+        DesiredOrder(price=o.price, side=o.side, size=o.size * scale)
+        if o.side == accumulate_side
+        else o
+        for o in orders
+    )

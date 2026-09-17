@@ -3,10 +3,12 @@ import math
 import pytest
 
 import ladder
+from market import MarginTier
 from settings import Zone, LONG, SHORT
 from strategy import distance, target_notional, signed
 
 ZONE = Zone(support=2371.26, resistance=2625.00)
+TIER = MarginTier(floor=0.0, cap=250000.0, maint_margin_rate=0.05, maint_amount=10.0)
 
 
 def test_rung_prices_span_support_to_resistance():
@@ -113,3 +115,93 @@ def test_desired_orders_splits_buy_and_sell_by_current_price():
             assert order.side == "BUY"
         elif order.price > 2500.0:
             assert order.side == "SELL"
+
+
+def test_liquidation_scale_already_unsafe_at_zero_returns_zero():
+    # q0=10, e0=100, WB0=... chosen so LiqPrice(0) > survival_price already.
+    k = ladder.liquidation_scale(
+        position_qty=10, entry_price=100, isolated_wallet=150, leverage=20,
+        tier=TIER, survival_price=70, planned_delta_qty=20,
+        planned_delta_notional=1800, trend=LONG,
+    )
+    assert k == 0.0
+
+
+def test_liquidation_scale_fully_safe_at_one_returns_one():
+    # Loose survival target, well past LiqPrice at full planned buying.
+    k = ladder.liquidation_scale(
+        position_qty=10, entry_price=100, isolated_wallet=300, leverage=20,
+        tier=TIER, survival_price=95, planned_delta_qty=20,
+        planned_delta_notional=1800, trend=LONG,
+    )
+    assert k == 1.0
+
+
+def test_liquidation_scale_partial_cap_matches_closed_form():
+    # Hand-derived: A=710, B=1710, D0=9.5, E=19, survival=80 -> k = 5/19.
+    k = ladder.liquidation_scale(
+        position_qty=10, entry_price=100, isolated_wallet=300, leverage=20,
+        tier=TIER, survival_price=80, planned_delta_qty=20,
+        planned_delta_notional=1800, trend=LONG,
+    )
+    assert k == pytest.approx(5 / 19, rel=1e-6)
+
+
+def test_liquidation_scale_result_actually_meets_the_survival_price():
+    # The scale found must make the projected liquidation price exactly the
+    # survival price at the boundary case (not just "close").
+    k = ladder.liquidation_scale(
+        position_qty=10, entry_price=100, isolated_wallet=300, leverage=20,
+        tier=TIER, survival_price=80, planned_delta_qty=20,
+        planned_delta_notional=1800, trend=LONG,
+    )
+    qty = 10 + k * 20
+    wallet = 300 + k * 1800 / 20
+    cost_basis = 100 * 10 + k * 1800
+    liq_price = (cost_basis - wallet + TIER.maint_amount) / (qty * (1 - TIER.maint_margin_rate))
+    assert liq_price == pytest.approx(80.0)
+
+
+def test_liquidation_scale_short_mirrors_long():
+    # Survival above current price for a short; same shape of answer.
+    k = ladder.liquidation_scale(
+        position_qty=10, entry_price=100, isolated_wallet=300, leverage=20,
+        tier=TIER, survival_price=120, planned_delta_qty=20,
+        planned_delta_notional=2200, trend=SHORT,
+    )
+    assert 0.0 <= k <= 1.0
+
+
+def test_survival_price_uses_next_lower_zone_for_long():
+    zones = (
+        Zone(support=2625.00, resistance=3284.04),
+        Zone(support=2371.26, resistance=2625.00),
+        Zone(support=1872.46, resistance=2371.26),
+    )
+    # active zone is index 0; next-lower is index 1, span 253.74.
+    target = ladder.survival_price(zones, active_index=0, trend=LONG, liquidation_buffer_pct=0.2)
+    next_zone = zones[1]
+    expected = next_zone.resistance - 0.2 * (next_zone.resistance - next_zone.support)
+    assert target == pytest.approx(expected)
+
+
+def test_survival_price_falls_back_to_own_span_at_the_lowest_zone_for_long():
+    zones = (
+        Zone(support=2625.00, resistance=3284.04),
+        Zone(support=2371.26, resistance=2625.00),
+        Zone(support=1872.46, resistance=2371.26),
+    )
+    target = ladder.survival_price(zones, active_index=2, trend=LONG, liquidation_buffer_pct=0.2)
+    edge = zones[2]
+    expected = edge.support - 0.2 * (edge.resistance - edge.support)
+    assert target == pytest.approx(expected)
+
+
+def test_apply_liquidation_cap_shrinks_only_the_accumulate_side():
+    orders = ladder.desired_orders(ZONE, LONG, max_n=5000.0, alpha=2.0, rung_spacing_pct=0.005, current_price=2500.0)
+    capped = ladder.apply_liquidation_cap(orders, scale=0.5, trend=LONG)
+    for original, adjusted in zip(orders, capped):
+        if original.side == "BUY":
+            assert adjusted.size == pytest.approx(original.size * 0.5)
+        else:
+            assert adjusted.size == original.size
