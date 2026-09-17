@@ -167,10 +167,12 @@ collection.
   carrying the changed fields as `{field: [old, new]}`). Under the throttle the next tick record can be
   up to a minute away, so without this the journal cannot say when an edit actually took effect. It is
   the counterpart to `config_refused`; keep both.
-- **Telegram notifications may never affect trading** (`futures/notify.py`). Five events are pushed:
-  every executed order (never throttled — fills are rare and each moves real money), the transition
-  into `HALT`, `startup_refused`, `config_refused`, and every loop `error` record the throttle lets
-  through. Three rules hold this together. (1) *It cannot
+- **Telegram notifications may never affect trading** (`futures/notify.py`). Six events are pushed:
+  every executed order (never throttled — fills are rare and each moves real money, and this covers both
+  a market-order fill and an individual ladder rung's fill — see `_journal_ladder_fill`), the transition
+  into `HALT`, `startup_refused`, `config_refused`, every loop `error` record the throttle lets through,
+  and the liquidation-cap brake engaging (`liquidation_brake`, pushed whenever the accumulate side is
+  shrunk or cancelled outright — see the ladder lifecycle notes below). Three rules hold this together. (1) *It cannot
   raise into the loop*: `send()` and every event entry point swallow `Exception` and return a bool, and
   the failure path is itself guarded and forced to ASCII — an f-string of a localised `OSError` on a
   `cp949` console is how the bot was killed once before. (2) *It cannot stall the loop*: every request
@@ -195,16 +197,21 @@ collection.
   `math.floor`). Rounding up would let the bot exceed its own exposure cap on the last partial step of a
   fill — flooring is the only direction that cannot overshoot.
 - **In-zone scaling rests as limit orders; every exit stays a market order** (`bot.run`'s
-  `in_zone_ladder_case`). `SCALE_IN`/`SCALE_OUT` decided *inside* the active zone
-  (`decision.zone_index is not None`) route through `ladder.py`/`_place_ladder`/`_reconcile_ladder` and
-  `execution.place_limit_order` — a rung ladder resting on the book instead of crossing the spread every
-  tick. `STOP_OUT`, `HALT_FLATTEN`, and the dead-band `SCALE_OUT` (`decision.zone_index is None`) are
-  unchanged from before the ladder existed: they still go through `execution.execute` (market). The
-  split is deliberate — an exit is the tick the bot decided the position must change size *now*, where
-  certainty of execution matters more than price, while in-zone scaling has no such urgency and can
-  afford to wait at its own limit price. Never route an exit through the ladder (it can't guarantee a
-  fill before the next tick), and never give in-zone scaling a market order "for speed" — that
-  reintroduces the exact spread cost the ladder exists to save.
+  `in_zone_ladder_case`). The split is on `decision.reason`, not `decision.zone_index`: only
+  `SCALE_IN`/`SCALE_OUT` decided *inside* the active zone route through `ladder.py`/`_place_ladder`/
+  `_reconcile_ladder` and `execution.place_limit_order` — a rung ladder resting on the book instead of
+  crossing the spread every tick (`in_zone_ladder_case = decision.zone_index is not None and
+  decision.reason in (SCALE_IN, SCALE_OUT)`). `HALT_FLATTEN` and the dead-band `SCALE_OUT` do have
+  `zone_index is None` (there is no active zone to scale within), but `STOP_OUT` does NOT — `strategy.
+  decide()` assigns `STOP_OUT` precisely when the newly-selected zone differs from `active_index` while a
+  position is held, so its `zone_index` is the new zone, not `None`; what excludes it from the ladder
+  path is that its `reason` is `STOP_OUT`, not `SCALE_IN`/`SCALE_OUT`. All three exits are unchanged from
+  before the ladder existed: they still go through `execution.execute` (market). The split is deliberate
+  — an exit is the tick the bot decided the position must change size *now*, where certainty of execution
+  matters more than price, while in-zone scaling has no such urgency and can afford to wait at its own
+  limit price. Never route an exit through the ladder (it can't guarantee a fill before the next tick),
+  and never give in-zone scaling a market order "for speed" — that reintroduces the exact spread cost the
+  ladder exists to save.
 - **The ladder's lifecycle is poll-detect-settle-reconcile, not fill-driven** (`bot.py`'s `LadderState`,
   `_place_ladder`, `_detect_fill`, `_reconcile_ladder`). There is no fill event to subscribe to:
   `_detect_fill` diffs the tracked rung-price -> order-id map against `market.get_open_orders` every
