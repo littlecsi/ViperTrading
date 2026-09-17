@@ -217,6 +217,31 @@ def _place_ladder(
         ladder_state.orders[rounded_price] = result["orderId"]
 
 
+def _cancel_ladder(api, cfg, ladder_state) -> None:
+    """Take the tracked rungs off the book, then forget them.
+
+    Every rung is a live order at a price chosen for ONE zone, so every way of
+    leaving that zone has to come through here: the step to the next zone, the
+    STOP_OUT/HALT_FLATTEN market exits, the dead-band scale-out, and a symbol
+    switch. Resetting the tracked ids WITHOUT cancelling is not a cheaper
+    version of this - it orphans the orders, leaving them resting with nothing
+    supervising them, and on the accumulate side they can fill straight back
+    into the position the exit just closed.
+
+    Cancel first, forget second: if cancel_orders raises partway the ids stay
+    tracked, so the next attempt retries the whole set rather than losing the
+    ones it never reached. An id already gone is tolerated inside
+    cancel_orders (-2011), which is what makes that retry safe.
+
+    A no-op when nothing is tracked, so the sticky exit states (HALT every
+    tick once price is off the ladder, a dead-band SCALE_OUT on residual dust)
+    cost one cancel pass in total rather than one per poll."""
+    if not ladder_state.orders:
+        return
+    execution.cancel_orders(api, cfg.symbol, list(ladder_state.orders.values()))
+    ladder_state.reset()
+
+
 def _sleep(seconds) -> None:
     """Sleep the poll interval, clamped, and unable to raise.
 
@@ -385,7 +410,14 @@ def run() -> None:
                             filters = new_filters
                             leverage_brackets = market.get_leverage_brackets(api, new_cfg.symbol)
                             # Zone state belongs to the old symbol's ladder and
-                            # means nothing on the new one.
+                            # means nothing on the new one. Cancel against
+                            # cfg.symbol, the symbol still in force, because
+                            # that is where the rungs are actually resting -
+                            # dropping the zone state without cancelling would
+                            # leave them on the old symbol's book forever, with
+                            # the bot now looking at a different market
+                            # entirely.
+                            _cancel_ladder(api, cfg, ladder_state)
                             active_index = None
                             changes = _config_changes(cfg, new_cfg)
                             cfg = new_cfg
@@ -487,15 +519,15 @@ def run() -> None:
                 and decision.reason in (strategy.SCALE_IN, strategy.SCALE_OUT)
             )
             # Placed on zone ACTIVATION only. A changed zone means the old
-            # zone's ladder is gone (the STOP_OUT that carried price here
-            # flattened the position), so its tracked rungs are discarded and a
-            # fresh set placed; an empty tracked set with the zone unchanged is
-            # the first entry into it. An already-placed ladder is left resting
-            # - re-placing it every tick would re-send the same rungs for as
-            # long as price sat in the zone. Decided HERE, above the journal
-            # write, because whether the tick acts is what the write policy
-            # keys on; nothing between here and the branch itself mutates
-            # active_index or ladder_state, so the answer cannot go stale.
+            # zone's rungs are priced for a zone the bot has left, so they are
+            # cancelled off the book and a fresh set placed; an empty tracked
+            # set with the zone unchanged is the first entry into it. An
+            # already-placed ladder is left resting - re-placing it every tick
+            # would re-send the same rungs for as long as price sat in the
+            # zone. Decided HERE, above the journal write, because whether the
+            # tick acts is what the write policy keys on; nothing between here
+            # and the branch itself mutates active_index or ladder_state, so
+            # the answer cannot go stale.
             placing_ladder = in_zone_ladder_case and (
                 decision.zone_index != active_index or not ladder_state.orders
             )
@@ -536,9 +568,45 @@ def run() -> None:
             )
 
             if decision.action in (strategy.HOLD, strategy.IDLE):
+                # A HOLD is normally "the ladder is resting and the position is
+                # where it should be", which must leave the rungs alone - but it
+                # is also what a zone change looks like when the new zone's
+                # target happens to sit within the rebalance threshold of the
+                # position (flat, and stepping into a zone whose target is
+                # small). Nothing else on this tick would then cancel, and the
+                # next tick would read the zone as unchanged with rungs already
+                # tracked, so the OLD zone's orders would quietly become the new
+                # zone's ladder. IDLE off the ladder entirely is the same
+                # problem with zone_index None. Cancelled BEFORE active_index
+                # advances, so a failed cancel is retried next tick.
+                if decision.zone_index != active_index:
+                    _cancel_ladder(api, cfg, ladder_state)
                 active_index = decision.zone_index
                 _sleep(cfg.poll_seconds)
                 continue
+
+            # Every action that is not the in-zone ladder case is an exit from
+            # the zone those rungs were placed for - STOP_OUT, HALT_FLATTEN, or
+            # the dead-band scale-out - so they come off the book first.
+            #
+            # Before the HALT latch below, and before the `not sending` check,
+            # for two reasons. A HALT whose remaining position is too small to
+            # close still has to cancel, or price leaves the ladder with the
+            # bot's accumulate rungs resting under it and nothing watching what
+            # they fill. And a cancel that fails must not have spent `halted`:
+            # this tick then flattens nothing, and a latched `halted` would make
+            # the retry a poll later flatten in silence, with no HALT ever
+            # announced. Failing here leaves the tick unfinished in every sense,
+            # which is what makes the next one a faithful retry.
+            #
+            # It does cost an HTTP round-trip ahead of the flatten. That is
+            # accepted deliberately here and nowhere else on this path (the HALT
+            # notification is still sent only AFTER the flatten): an accumulate
+            # rung left resting can fill straight back into the position the
+            # flatten just closed, so cancelling afterwards is a race the bot
+            # loses, while a slow Telegram buys nothing at all.
+            if not in_zone_ladder_case:
+                _cancel_ladder(api, cfg, ladder_state)
 
             # The transition into HALT, announced once. The NOTIFICATION is not
             # sent here: HALT means price left the ladder in the direction that
@@ -562,6 +630,18 @@ def run() -> None:
                 }
 
             if in_zone_ladder_case:
+                if placing_ladder:
+                    # The old zone's rungs come off the book before the new
+                    # zone's go on - and deliberately OUTSIDE the try/finally
+                    # below. A cancel that fails has placed nothing, so leaving
+                    # active_index where it is makes the next tick read the
+                    # same zone change and retry the cancel (an id already gone
+                    # is tolerated as -2011). Advancing past a failed cancel
+                    # would do the opposite: the old zone's rungs stay live on
+                    # the book while the bot counts them as the new zone's, and
+                    # nothing ever cancels them. No-op on a first entry, where
+                    # nothing is tracked yet.
+                    _cancel_ladder(api, cfg, ladder_state)
                 try:
                     if placing_ladder:
                         ladder_state.reset()
@@ -575,18 +655,20 @@ def run() -> None:
                     # Without it a half-placed ladder is not merely incomplete,
                     # it is catastrophic: the rungs already accepted are LIVE on
                     # the exchange, but the next tick would still read the zone
-                    # as changed, reset the tracked ids - forgetting those live
-                    # orders rather than cancelling them - and place the whole
-                    # set again, once per poll, unbounded. Rejection partway is
-                    # the ordinary case, not an exotic one: at exposure_fraction
-                    # 1.0 the margin runs out mid-ladder and Binance answers
-                    # -2019. Advancing here makes the retry condition false
-                    # instead, so a partial ladder is simply left resting as it
-                    # is; the rungs that did place are still tracked, and the
-                    # gap is what the reconciliation pass is for. When NOTHING
-                    # placed, the tracked set is still empty, so the next tick
-                    # correctly retries from scratch - safe, because there is
-                    # nothing resting yet to duplicate.
+                    # as changed, cancel the rungs it had just placed and place
+                    # the whole set again - once per poll, unbounded, churning
+                    # orders against a margin wall that is not going away.
+                    # Rejection partway is the ordinary case, not an exotic one:
+                    # at exposure_fraction 1.0 the margin runs out mid-ladder
+                    # and Binance answers -2019. Advancing here makes the retry
+                    # condition false instead, so a partial ladder is simply
+                    # left resting as it is; the rungs that did place are still
+                    # tracked, and the gap is what the reconciliation pass is
+                    # for. When NOTHING placed, the tracked set is still empty,
+                    # so the next tick correctly retries from scratch - safe,
+                    # because there is nothing resting yet to duplicate. The
+                    # cancel that preceded this block is the one step that is
+                    # NOT retry-safe to skip, which is why it sits outside.
                     active_index = decision.zone_index
                 _sleep(cfg.poll_seconds)
                 continue

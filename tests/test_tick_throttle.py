@@ -215,26 +215,40 @@ def test_config_reloaded_record_is_written_unthrottled(written):
 class LoopClient:
     """Enough of UMFutures for one trip round bot.run()."""
 
-    def __init__(self, price="2700.00", balance="0.0", order_error=None, margin_type_error=None):
+    def __init__(self, price="2700.00", balance="0.0", order_error=None, margin_type_error=None,
+                 price_schedule=None, position="0.0", cancel_error=None):
         self.price = price
+        # {ticker_price call number: new price}. bot.run() has no supported
+        # pause/resume, so walking price across a zone boundary inside ONE
+        # run_loop() call is the only way to drive a transition. Call 1 is
+        # run()'s startup reconciliation read, so loop tick N is call N + 1.
+        self.price_schedule = price_schedule or {}
+        self.price_reads = 0
         self._balance = balance
+        self.position = position
         self.order_error = order_error
+        self.cancel_error = cancel_error
         self.margin_type_error = margin_type_error
         self.orders = 0
         self.placed_orders = []
+        self.cancelled = []  # (symbol, orderId) per cancel_order call
+        self.events = []  # ("place", type) / ("cancel", orderId), in call order
         self.margin_type_calls = []
 
     def exchange_info(self):
         return {
             "symbols": [
                 {
-                    "symbol": "ETHUSDT",
+                    "symbol": symbol,
                     "filters": [
                         {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
                         {"filterType": "MIN_NOTIONAL", "notional": "20"},
                         {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
                     ],
                 }
+                # BTCUSDT is here only so a symbol-switch reload has somewhere
+                # to switch TO; the filters are deliberately identical.
+                for symbol in ("ETHUSDT", "BTCUSDT")
             ]
         }
 
@@ -242,6 +256,9 @@ class LoopClient:
         return {"symbol": symbol, "leverage": leverage}
 
     def ticker_price(self, symbol):
+        self.price_reads += 1
+        if self.price_reads in self.price_schedule:
+            self.price = self.price_schedule[self.price_reads]
         return {"symbol": symbol, "price": self.price}
 
     def balance(self):
@@ -249,7 +266,8 @@ class LoopClient:
 
     def get_position_risk(self, symbol=None):
         return [{
-            "symbol": "ETHUSDT", "positionAmt": "0.0", "unRealizedProfit": "0.0",
+            "symbol": symbol or "ETHUSDT", "positionAmt": self.position,
+            "unRealizedProfit": "0.0",
             "liquidationPrice": "0.0", "entryPrice": "0.0", "isolatedWallet": "0.0",
         }]
 
@@ -258,9 +276,19 @@ class LoopClient:
         # (GET /fapi/v1/openOrders), not the singular `get_open_order`.
         return []
 
+    def cancel_order(self, symbol, orderId):
+        self.cancelled.append((symbol, orderId))
+        self.events.append(("cancel", orderId))
+        if self.cancel_error is not None:
+            error = self.cancel_error(len(self.cancelled))
+            if error:
+                raise error
+        return {"orderId": orderId, "status": "CANCELED"}
+
     def new_order(self, **params):
         self.orders += 1
         self.placed_orders.append(params)
+        self.events.append(("place", params.get("type")))
         if self.order_error is not None:
             # A falsy return means "accept this one", so a test can reject only
             # some calls - a ladder whose margin runs out partway through.
@@ -511,3 +539,156 @@ def test_a_fully_rejected_ladder_still_retries_next_tick(monkeypatch, written):
     run_loop(monkeypatch, written, ticks=10, api=api)
 
     assert api.orders == 10  # one attempt per tick, still trying
+
+
+# --- the ladder comes off the book when its zone is left -------------------
+#
+# A resting rung is a live order at a price chosen for ONE zone. Every way of
+# leaving that zone - stepping to the next one, stopping out of it, halting off
+# the ladder entirely, or switching symbol - has to take those rungs off the
+# book. Forgetting them (resetting the tracked ids without cancelling) leaves
+# orders nothing supervises, which on the accumulate side can re-open a
+# position the bot has just decided to be out of.
+
+
+def ladder_order_ids(api):
+    """Ids of the LIMIT orders this client was asked to place, in order. The
+    fake numbers order ids from 1 in call order, so the index gives the id."""
+    return [i + 1 for i, p in enumerate(api.placed_orders) if p.get("type") == "LIMIT"]
+
+
+def first_tick_ladder(monkeypatch, position="0.0"):
+    """The rung ids one tick at 2500 places - the ladder a later tick has to
+    cancel. Taken from a control run rather than assumed, so the expectation
+    tracks the real zone geometry."""
+    control = LoopClient(price="2500.00", balance="1000.0", position=position)
+    run_loop(monkeypatch, [], ticks=1, api=control)
+    return ladder_order_ids(control)
+
+
+def cancelled_ids(api):
+    return [order_id for _symbol, order_id in api.cancelled]
+
+
+def test_a_zone_change_cancels_the_old_zones_ladder(monkeypatch, written):
+    """Zone 1 (2371.26-2625.00) activates at 2500 and rests a ladder. Price
+    then falls to 2200, past the stop_buffer below that support, so zone 2
+    takes over: the old zone's rungs are priced for a zone the bot has left and
+    must be cancelled, not merely forgotten, before the new ladder goes on."""
+    api = LoopClient(price="2500.00", balance="1000.0", price_schedule={3: "2200.00"})
+    run_loop(monkeypatch, written, ticks=2, api=api)
+
+    first = first_tick_ladder(monkeypatch)
+    assert first  # the first tick really did rest a ladder
+    assert cancelled_ids(api) == first
+    assert len(ladder_order_ids(api)) > len(first)  # and a fresh one replaced it
+
+
+def test_a_zone_change_decided_as_hold_still_cancels(monkeypatch, written):
+    """The same zone change, at a price where the new zone's target lands
+    inside the rebalance threshold: the strategy says HOLD, and a HOLD normally
+    leaves a resting ladder alone. The zone still changed, though, so the old
+    rungs have to go - otherwise the next tick sees the zone as unchanged with
+    orders already tracked and adopts zone 1's ladder as zone 2's."""
+    api = LoopClient(price="2500.00", balance="1000.0", price_schedule={3: "2300.00"})
+    records = run_loop(monkeypatch, written, ticks=2, api=api)
+
+    assert records[-1]["action"] == strategy.HOLD  # not the ladder branch
+    assert records[-1]["active_zone_index"] == 2  # but a different zone
+    assert cancelled_ids(api) == first_tick_ladder(monkeypatch)
+
+
+def test_stop_out_cancels_the_resting_ladder_before_the_market_order(monkeypatch, written):
+    """Same zone change, but holding a position, so the strategy calls it a
+    STOP_OUT and exits with a MARKET order. The rungs must come off the book
+    BEFORE that order: an accumulate rung left resting can fill straight back
+    into the position the stop-out just closed."""
+    api = LoopClient(
+        price="2500.00", balance="1000.0", position="0.2",
+        price_schedule={3: "2300.00"},
+    )
+    run_loop(monkeypatch, written, ticks=2, api=api)
+
+    assert cancelled_ids(api) == first_tick_ladder(monkeypatch, position="0.2")
+    kinds = [kind for kind, _ in api.events]
+    assert ("place", "MARKET") in api.events  # the exit itself still crosses
+    market_at = api.events.index(("place", "MARKET"))
+    assert kinds.index("cancel") < market_at
+    assert "cancel" not in kinds[market_at:]  # all of it, before the exit
+
+
+def test_halt_cancels_the_resting_ladder_before_flattening(monkeypatch, written):
+    """Price leaves the ladder below every support: HALT_FLATTEN. The flatten
+    is worthless if a BUY rung is still resting underneath it."""
+    api = LoopClient(
+        price="2500.00", balance="1000.0", position="0.2",
+        price_schedule={3: "1800.00"},
+    )
+    records = run_loop(monkeypatch, written, ticks=2, api=api)
+
+    assert any(r.get("action") == strategy.HALT for r in records)
+    assert cancelled_ids(api) == first_tick_ladder(monkeypatch, position="0.2")
+    kinds = [kind for kind, _ in api.events]
+    assert kinds.index("cancel") < api.events.index(("place", "MARKET"))
+
+
+def test_a_failed_cancel_does_not_swallow_the_halt_announcement(monkeypatch, written):
+    """`halted` latches so HALT is announced once, not once per poll. A cancel
+    that fails must therefore not have latched it: the flatten did not happen
+    on that tick, and if the latch were already spent the retry a poll later
+    would flatten in total silence - no operator would ever learn the bot's
+    thesis died."""
+    from binance.error import ClientError
+
+    halts = []
+    monkeypatch.setattr(bot.notify, "halt", lambda **kw: halts.append(kw.get("outcome")))
+
+    api = LoopClient(
+        price="2500.00", balance="1000.0", position="0.2",
+        price_schedule={3: "1800.00"},
+        cancel_error=lambda n: ClientError(400, -1001, "Internal error", {}) if n == 1 else None,
+    )
+    run_loop(monkeypatch, written, ticks=3, api=api)
+
+    assert halts == [bot.notify.FLATTENED]  # announced on the tick it worked
+    assert ("place", "MARKET") in api.events
+
+
+def test_a_symbol_switch_cancels_the_old_symbols_ladder(monkeypatch, written):
+    """Switching symbol resets the zone state, and the old symbol's rungs have
+    to go with it - against the OLD symbol, which is where they are resting."""
+    base = bot.settings.load()
+    switched = bot.settings.Settings(**{**base.__dict__, "symbol": "BTCUSDT"})
+    calls = {"n": 0}
+
+    def load():
+        calls["n"] += 1
+        # Tick 1 sees the running config (the ladder goes on ETHUSDT); the
+        # switch arrives on tick 2.
+        return base if calls["n"] == 1 else switched
+
+    api = LoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, written, ticks=2, api=api, load=load)
+
+    first = first_tick_ladder(monkeypatch)
+    assert cancelled_ids(api) == first
+    assert {symbol for symbol, _ in api.cancelled} == {"ETHUSDT"}
+
+
+def test_a_failed_cancel_is_retried_rather_than_stranding_the_old_rungs(monkeypatch, written):
+    """A cancel that fails has placed nothing, so the zone change must stay
+    unfinished and be retried. Advancing past it would leave the old zone's
+    rungs live on the book while the bot counted them as the new zone's."""
+    from binance.error import ClientError
+
+    api = LoopClient(
+        price="2500.00", balance="1000.0", price_schedule={3: "2200.00"},
+        cancel_error=lambda n: ClientError(400, -1001, "Internal error", {}) if n == 1 else None,
+    )
+    records = run_loop(monkeypatch, written, ticks=3, api=api)
+
+    first = first_tick_ladder(monkeypatch)
+    assert actions(records)["error"] == 1  # the failure was recorded, not hidden
+    # Every rung was cancelled in the end, the failed one having been retried.
+    assert set(cancelled_ids(api)) == set(first)
+    assert len(ladder_order_ids(api)) > len(first)  # and the new zone's ladder went on
