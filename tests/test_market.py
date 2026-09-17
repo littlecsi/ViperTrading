@@ -8,7 +8,16 @@ BALANCES = [
     {"asset": "BNB", "balance": "0.0", "availableBalance": "0.0"},
 ]
 
-POSITIONS = [{"symbol": "ETHUSDT", "positionAmt": "-1.250", "unRealizedProfit": "-12.5"}]
+POSITIONS = [
+    {
+        "symbol": "ETHUSDT",
+        "positionAmt": "-1.250",
+        "unRealizedProfit": "-12.5",
+        "liquidationPrice": "2950.50",
+        "entryPrice": "2400.00",
+        "isolatedWallet": "600.00",
+    }
+]
 
 
 class FakeClient:
@@ -144,3 +153,19 @@ def test_set_leverage_calls_client():
     c = FakeClient()
     market.set_leverage(c, "ETHUSDT", 5)
     assert c.leverage_calls == [("ETHUSDT", 5)]
+
+
+def test_liquidation_price_from():
+    assert market.liquidation_price_from(POSITIONS, "ETHUSDT") == 2950.50
+
+
+def test_liquidation_price_from_unknown_symbol_is_zero():
+    assert market.liquidation_price_from(POSITIONS, "BTCUSDT") == 0.0
+
+
+def test_entry_price_from():
+    assert market.entry_price_from(POSITIONS, "ETHUSDT") == 2400.00
+
+
+def test_isolated_wallet_from():
+    assert market.isolated_wallet_from(POSITIONS, "ETHUSDT") == 600.00

@@ -94,6 +94,26 @@ def unrealized_pnl_from(positions, symbol: str) -> float:
     return float(entry["unRealizedProfit"]) if entry else 0.0
 
 
+def liquidation_price_from(positions, symbol: str) -> float:
+    """Binance's own projected liquidation price for the current position.
+    Ground truth for the liquidation-cap backstop -- see ladder.py and the
+    design doc's "Liquidation-aware buy-side cap"."""
+    entry = _position_entry(positions, symbol)
+    return float(entry["liquidationPrice"]) if entry else 0.0
+
+
+def entry_price_from(positions, symbol: str) -> float:
+    entry = _position_entry(positions, symbol)
+    return float(entry["entryPrice"]) if entry else 0.0
+
+
+def isolated_wallet_from(positions, symbol: str) -> float:
+    """Margin currently allocated to this symbol's isolated position. Feeds
+    the liquidation-cap projection; see ladder.liquidation_scale()."""
+    entry = _position_entry(positions, symbol)
+    return float(entry["isolatedWallet"]) if entry else 0.0
+
+
 # --- exchange reads --------------------------------------------------------
 
 
