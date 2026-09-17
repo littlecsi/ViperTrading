@@ -273,6 +273,106 @@ def _detect_fill(api, cfg, ladder_state) -> tuple:
     return tuple(tracked_ids - open_ids)
 
 
+def _reconcile_ladder(
+    api, cfg, decision, price, snapshot, filters, leverage_brackets, ladder_state
+) -> None:
+    """Rebuild the ladder around the position the fills actually left behind.
+
+    Reached only from the settling branch, on a tick that found the open-order
+    set unchanged since the fill that started the wait - i.e. the market has
+    stopped moving through the rungs (design doc, "Lifecycle" step 4). Doing it
+    any earlier would price a whole new ladder off a position that is still
+    filling, once per poll, for as long as the move lasted.
+
+    Unlike _place_ladder this runs against a REAL position, which is the whole
+    point: the liquidation guard is given the position's actual quantity, entry
+    price and isolated margin instead of the zeros activation is entitled to
+    assume, so the remaining accumulate side is sized against the risk already
+    on the book rather than from scratch.
+
+    The result is a DIFF, not a re-place. ladder.plan_orders leaves a rung that
+    still matches what is resting exactly where it is, so an unchanged ladder
+    costs nothing; only rungs whose price, side or (post-flooring) quantity
+    genuinely moved are cancelled, and only genuinely missing ones are sent.
+    Cancellation here is per-id (execution.cancel_orders), never the
+    whole-symbol sweep: this keeps most of the ladder and replaces part of it,
+    which is exactly the case cancel_all_orders is wrong for."""
+    zone = cfg.zones[decision.zone_index]
+    desired = ladder.desired_orders(
+        zone, cfg.trend, decision.max_n, cfg.alpha, cfg.rung_spacing_pct, price
+    )
+
+    position_qty = abs(snapshot.position_amt)
+    survival = ladder.survival_price(
+        cfg.zones, decision.zone_index, cfg.trend, cfg.liquidation_buffer_pct
+    )
+    tier = market.maintenance_tier_from(leverage_brackets, position_qty * price)
+
+    accumulate_side = "BUY" if cfg.trend == settings.LONG else "SELL"
+    planned_delta_notional = sum(o.size for o in desired if o.side == accumulate_side)
+    # As in _place_ladder: the planned quantity is the accumulate-side notional
+    # over CURRENT price rather than a per-rung sum over each rung's own price.
+    # That understates quantity, which overstates the average entry, which
+    # projects the liquidation nearer the adverse side than it really is - the
+    # approximation errs toward capping too hard, never too little.
+    planned_delta_qty = planned_delta_notional / price if price else 0.0
+
+    # Guarded exactly as the activation path is. With nothing to accumulate
+    # there is nothing for the cap to act on, and asking anyway would report
+    # scale 0.0 for an already-unsafe position and push a LIQUIDATION BRAKE
+    # notification per reconcile that named no rung it had actually shrunk.
+    scale = 1.0
+    if planned_delta_notional > 0:
+        scale = ladder.liquidation_scale(
+            position_qty=position_qty,
+            entry_price=snapshot.entry_price,
+            isolated_wallet=snapshot.isolated_wallet,
+            leverage=cfg.leverage,
+            tier=tier,
+            survival_price=survival,
+            planned_delta_qty=planned_delta_qty,
+            planned_delta_notional=planned_delta_notional,
+            trend=cfg.trend,
+        )
+    capped = ladder.apply_liquidation_cap(desired, scale, cfg.trend) if scale < 1.0 else desired
+
+    valid, _deferred = ladder.validate_orders(capped, price, cfg.trend, filters)
+    open_orders = market.get_open_orders(api, cfg.symbol)
+    plan = ladder.plan_orders(valid, open_orders, filters)
+
+    # Cancel before placing: the rungs being replaced hold margin, and sending
+    # their replacements first is how a reconcile runs into -2019 against its
+    # own outgoing orders.
+    if plan.cancel:
+        execution.cancel_orders(api, cfg.symbol, list(plan.cancel))
+        for rung_price, order_id in list(ladder_state.orders.items()):
+            if order_id in plan.cancel:
+                del ladder_state.orders[rung_price]
+
+    for order in plan.place:
+        qty = execution.quantity_for(order.size, order.price, filters)
+        if not execution.is_executable(qty, order.price, filters):
+            continue
+        rounded_price = execution.price_for(order.price, filters, order.side)
+        result = execution.place_limit_order(api, cfg.symbol, order.side, qty, rounded_price)
+        ladder_state.orders[rounded_price] = result["orderId"]
+
+    # After the book work, never before it: this is an HTTP call worth up to
+    # notify.TIMEOUT_SECONDS and nothing that talks to Telegram gets in front
+    # of an order. notify cannot raise.
+    if scale < 1.0:
+        notify.liquidation_brake(
+            symbol=cfg.symbol, trend=cfg.trend, leverage=cfg.leverage,
+            survival_price=survival, liquidation_price=snapshot.liquidation_price,
+            scale=scale, cancelled=(scale == 0.0),
+        )
+
+    # The wait is over whether or not the diff had anything in it. Leaving the
+    # flag set would make the next tick compare against a snapshot this pass
+    # has just invalidated, and re-reconcile every other tick forever.
+    ladder_state.settling = False
+
+
 def _notify_cancel_failure(message, symbol) -> None:
     """Push a failed exit-path ladder cancel - AFTER the flatten, never before.
 
@@ -724,6 +824,32 @@ def run() -> None:
                             api, cfg, decision.zone_index, price, decision.max_n,
                             filters, leverage_brackets, ladder_state,
                         )
+                    elif ladder_state.settling:
+                        # Checked BEFORE _detect_fill, and the order is load
+                        # bearing. A filled id is absent from the open orders
+                        # from then on, so _detect_fill keeps reporting the
+                        # same rung on every later tick; tried first it would
+                        # re-arm settling every tick, this branch would be
+                        # unreachable, and the ladder would never be
+                        # reconciled at all.
+                        #
+                        # Stability is "the open-order set did not move since
+                        # the last look". Unchanged means no NEW fill since the
+                        # wait began, so the position has stopped moving and
+                        # the ladder can safely be rebuilt around it. Changed
+                        # means the cascade is still running: re-snapshot and
+                        # keep waiting, which is what stops reconciliation
+                        # firing against a moving target.
+                        open_now = frozenset(
+                            o["orderId"] for o in market.get_open_orders(api, cfg.symbol)
+                        )
+                        if open_now == ladder_state.settling_snapshot:
+                            _reconcile_ladder(
+                                api, cfg, decision, price, snapshot, filters,
+                                leverage_brackets, ladder_state,
+                            )
+                        else:
+                            ladder_state.settling_snapshot = open_now
                     elif _detect_fill(api, cfg, ladder_state):
                         # A rung filled, so the ladder no longer matches the
                         # position - but this tick does NOTHING about it beyond
@@ -762,6 +888,66 @@ def run() -> None:
                     # cancel that preceded this block is the one step that is
                     # NOT retry-safe to skip, which is why it sits outside.
                     active_index = decision.zone_index
+
+                # The backstop, run on every in-zone tick whichever branch above
+                # was taken and whether or not the ladder is settling - the one
+                # guard that does not wait for the market to stop moving. (A
+                # branch that RAISED skips it and goes to the loop's error
+                # handler; the rungs are still tracked, so the next tick tries
+                # again.) The cap inside _place_ladder/_reconcile_ladder sizes
+                # the accumulate
+                # side in advance, from a projection of where the liquidation
+                # price would end up; this is Binance's own answer for where it
+                # is NOW, and it overrides the projection. Once that reported
+                # figure has crossed the price this position must survive to,
+                # every remaining accumulate-side order comes off the book
+                # immediately - see design doc "Liquidation-aware buy-side
+                # cap", point 4.
+                #
+                # Per-id (execution.cancel_orders), never cancel_all_orders:
+                # only the accumulate side goes, because the trim side REDUCES
+                # the exposure that caused the breach and taking it down would
+                # make things worse. That is what separates this from a ladder
+                # teardown, which is the one case the whole-symbol sweep is for.
+                #
+                # A reported liquidation_price of 0 means the exchange has no
+                # figure for this symbol, not a liquidation at zero: for a
+                # short, "0 <= survival" would otherwise read as a permanent
+                # breach.
+                if ladder_state.orders and snapshot.position_amt != 0 and (
+                    snapshot.liquidation_price > 0
+                ):
+                    survival = ladder.survival_price(
+                        cfg.zones, decision.zone_index, cfg.trend,
+                        cfg.liquidation_buffer_pct,
+                    )
+                    breached = (
+                        snapshot.liquidation_price >= survival
+                        if cfg.trend == settings.LONG
+                        else snapshot.liquidation_price <= survival
+                    )
+                    if breached:
+                        accumulate_side = "BUY" if cfg.trend == settings.LONG else "SELL"
+                        to_cancel = [
+                            o["orderId"]
+                            for o in market.get_open_orders(api, cfg.symbol)
+                            if o["side"] == accumulate_side
+                        ]
+                        # Empty on every tick after the first one that fired,
+                        # so a sustained breach costs one sweep, not one per
+                        # poll - and pushes one notification, not a stream.
+                        if to_cancel:
+                            execution.cancel_orders(api, cfg.symbol, to_cancel)
+                            for rung_price, order_id in list(ladder_state.orders.items()):
+                                if order_id in to_cancel:
+                                    del ladder_state.orders[rung_price]
+                            notify.liquidation_brake(
+                                symbol=cfg.symbol, trend=cfg.trend,
+                                leverage=cfg.leverage, survival_price=survival,
+                                liquidation_price=snapshot.liquidation_price,
+                                scale=0.0, cancelled=True,
+                            )
+
                 _sleep(cfg.poll_seconds)
                 continue
 

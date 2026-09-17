@@ -138,6 +138,24 @@ def test_get_snapshot_carries_every_field():
     assert snap.available_balance == 850.5
 
 
+def test_get_snapshot_carries_ladder_fields():
+    """The liquidation cap and its reported-price backstop need entry price,
+    isolated wallet and liquidation price every tick. They come off the SAME
+    position-risk payload the snapshot already fetches - adding a field must
+    not add a fourth REST call (see test_get_snapshot_hits_each_endpoint_once)."""
+    snap = market.get_snapshot(FakeClient(), "ETHUSDT")
+    assert snap.entry_price == 2400.00
+    assert snap.isolated_wallet == 600.00
+    assert snap.liquidation_price == 2950.50
+
+
+def test_get_snapshot_ladder_fields_are_zero_for_an_untraded_symbol():
+    snap = market.get_snapshot(FakeClient(), "BTCUSDT")
+    assert snap.entry_price == 0.0
+    assert snap.isolated_wallet == 0.0
+    assert snap.liquidation_price == 0.0
+
+
 def test_get_snapshot_hits_each_endpoint_once():
     """The whole point of the snapshot: 3 calls, 11 request weight. Fetching
     /balance or /positionRisk twice a tick is what put a one-second poll at 53%

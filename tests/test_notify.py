@@ -478,7 +478,10 @@ class Holding(loop.LoopClient):
         self.events = [] if events is None else events
 
     def get_position_risk(self, symbol=None):
-        return [{"symbol": "ETHUSDT", "positionAmt": self.amt, "unRealizedProfit": "0.0"}]
+        return [{
+            "symbol": "ETHUSDT", "positionAmt": self.amt, "unRealizedProfit": "0.0",
+            "liquidationPrice": "0.0", "entryPrice": "0.0", "isolatedWallet": "0.0",
+        }]
 
     def new_order(self, **params):
         # Logged BEFORE the (possibly raising) call: what is being asserted is
@@ -506,7 +509,10 @@ class Trimming(loop.LoopClient):
         self.amt = amt
 
     def get_position_risk(self, symbol=None):
-        return [{"symbol": "ETHUSDT", "positionAmt": self.amt, "unRealizedProfit": "0.0"}]
+        return [{
+            "symbol": "ETHUSDT", "positionAmt": self.amt, "unRealizedProfit": "0.0",
+            "liquidationPrice": "0.0", "entryPrice": "0.0", "isolatedWallet": "0.0",
+        }]
 
     def new_order(self, **params):
         result = super().new_order(**params)
@@ -680,7 +686,8 @@ def test_a_broken_notifier_costs_nothing_but_the_notification(monkeypatch, writt
 def test_startup_refusal_notifies_and_the_bot_still_refuses(monkeypatch, written, sent):
     api = loop.LoopClient(balance="1000.0")
     monkeypatch.setattr(api, "get_position_risk", lambda symbol=None: [
-        {"symbol": "ETHUSDT", "positionAmt": "-5.0", "unRealizedProfit": "0.0"}
+        {"symbol": "ETHUSDT", "positionAmt": "-5.0", "unRealizedProfit": "0.0",
+         "liquidationPrice": "0.0", "entryPrice": "0.0", "isolatedWallet": "0.0"}
     ])
     drive(monkeypatch, api, ticks=1)  # run() returns before it ever sleeps
 

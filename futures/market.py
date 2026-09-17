@@ -86,13 +86,24 @@ class Snapshot:
     so these fields come from three moments a few hundred milliseconds apart:
     position and unrealized_pnl share one instant, wallet_balance and
     available_balance share another, mark_price is a third. Do not build margin
-    or liquidation arithmetic on an assumption of consistency between them."""
+    or liquidation arithmetic on an assumption of consistency between them.
+
+    entry_price, isolated_wallet and liquidation_price ride along on the
+    position-risk payload the tick already fetches, so carrying them costs no
+    extra call and no extra instant - they share position_amt's moment exactly.
+    The first two feed ladder.liquidation_scale()'s projection of where the
+    liquidation price would end up after the planned accumulation; the third is
+    the exchange's own answer for where it is NOW, which the backstop uses to
+    override that projection."""
 
     mark_price: float
     position_amt: float
     unrealized_pnl: float
     wallet_balance: float
     available_balance: float
+    entry_price: float
+    isolated_wallet: float
+    liquidation_price: float
 
 
 # --- pure extractors -------------------------------------------------------
@@ -180,6 +191,9 @@ def get_snapshot(client, symbol: str, asset: str = "USDT") -> Snapshot:
         unrealized_pnl=unrealized_pnl_from(positions, symbol),
         wallet_balance=wallet_balance_from(balances, asset),
         available_balance=available_balance_from(balances, asset),
+        entry_price=entry_price_from(positions, symbol),
+        isolated_wallet=isolated_wallet_from(positions, symbol),
+        liquidation_price=liquidation_price_from(positions, symbol),
     )
 
 

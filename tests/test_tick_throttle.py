@@ -240,6 +240,7 @@ class LoopClient:
         self.open_orders_after_tick = open_orders_after_tick or {}
         self._open_orders = []
         self.cancelled = []  # one symbol per cancel_open_orders call
+        self.cancelled_order_ids = []  # one id per cancel_order call
         self.events = []  # ("place", type) / ("cancel", symbol), in call order
         self.margin_type_calls = []
 
@@ -294,9 +295,20 @@ class LoopClient:
             self._open_orders = [o for o in self._open_orders if o["orderId"] in keep]
         return list(self._open_orders)
 
-    # Deliberately NO cancel_order: the ladder teardown must take the whole
-    # symbol off the book in one request, so a regression to the per-id loop
-    # cannot quietly pass these tests - it raises AttributeError instead.
+    def cancel_order(self, symbol, orderId):
+        """Per-id cancellation, for the SELECTIVE cases only - reconciling a
+        settled ladder, and the liquidation backstop taking the accumulate
+        side off the book while the trim side stays. The ladder TEARDOWN must
+        never come through here: it abandons the whole set, and one blocking
+        round-trip per rung in front of a flatten is the thing
+        cancel_open_orders exists to avoid. The teardown tests therefore assert
+        that this list stayed empty, which is what keeps that regression
+        visible now that the method exists at all."""
+        self.cancelled_order_ids.append(orderId)
+        self.events.append(("cancel_one", orderId))
+        self._open_orders = [o for o in self._open_orders if o["orderId"] != orderId]
+        return {"orderId": orderId, "status": "CANCELED"}
+
     def cancel_open_orders(self, symbol):
         self.cancelled.append(symbol)
         self.events.append(("cancel", symbol))
@@ -629,6 +641,123 @@ def test_a_filled_rung_enters_settling_without_reconciling_the_same_tick(monkeyp
     assert api.orders == control.orders  # and nothing replaced, this tick
 
 
+# --- a settled ladder is reconciled against the position the fills left ----
+#
+# Settling ends on the first tick that finds the open-order set UNCHANGED
+# since the fill that started the wait: the market has stopped moving through
+# the rungs, so the ladder can be rebuilt against the position those fills
+# actually left behind (design doc "Lifecycle", step 4). Reconciliation is a
+# diff, not a re-place: rungs that still match are left resting.
+
+
+def resting_ladder_ids(monkeypatch):
+    """The rung ids one tick at 2500 rests, taken from a control run so the
+    expectation tracks the real zone geometry rather than a hard-coded count."""
+    control = LoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, [], ticks=1, api=control)
+    return [o["orderId"] for o in control._open_orders]
+
+
+def test_settled_ladder_reconciles_to_the_new_desired_set(monkeypatch, written):
+    """One rung fills, the book then stops changing, and the gap is refilled.
+
+    This is also the test that pins the ORDER of the two checks in run(): the
+    settling branch has to be tried BEFORE _detect_fill. A filled id is absent
+    from the open orders forever after, so _detect_fill keeps reporting it on
+    every later tick; checked first, it would re-enter settling every tick, the
+    settling branch would be unreachable, and the ladder would never be
+    reconciled at all - api.orders would simply stop growing here."""
+    all_ids = resting_ladder_ids(monkeypatch)
+    filled = all_ids[0]
+
+    api = LoopClient(
+        price="2500.00", balance="1000.0",
+        open_orders_after_tick={2: [i for i in all_ids if i != filled]},
+    )
+    # Tick 1 places the ladder. Tick 2 sees the rung gone -> settling. Tick 3
+    # finds the open set unchanged from tick 2 -> stable -> reconcile.
+    records = run_loop(monkeypatch, written, ticks=3, api=api)
+
+    # Exactly the one missing rung is replaced: price and balance never moved,
+    # so every other rung still matches what is resting and is left alone.
+    assert "error" not in actions(records)  # and it got there without raising
+    assert api.orders == len(all_ids) + 1
+    assert api.cancelled == []  # no whole-symbol teardown
+    assert api.cancelled_order_ids == []  # and nothing selectively cancelled
+
+
+def test_settling_waits_while_the_open_order_set_is_still_changing(monkeypatch, written):
+    """A second fill before the set stabilises restarts the wait.
+
+    Reconciling mid-cascade would rebuild the ladder against a position that is
+    still filling, once per poll, while the move is still running."""
+    all_ids = resting_ladder_ids(monkeypatch)
+
+    api = LoopClient(
+        price="2500.00", balance="1000.0",
+        open_orders_after_tick={
+            2: [i for i in all_ids if i != all_ids[0]],
+            3: [i for i in all_ids if i not in all_ids[:2]],
+        },
+    )
+    records = run_loop(monkeypatch, written, ticks=3, api=api)
+
+    # Tick 3 found the set changed again, so it re-snapshotted and placed
+    # nothing; only tick 1's ladder has ever been sent. Checked against the
+    # error stream too, so a reconcile that RAISED cannot read as one that
+    # correctly declined to run.
+    assert "error" not in actions(records)
+    assert api.orders == len(all_ids)
+    assert api.cancelled == []
+    assert api.cancelled_order_ids == []
+
+
+# --- the reported-liquidation-price backstop -------------------------------
+#
+# The cap sizes the accumulate side in ADVANCE from a projection. Binance's own
+# reported liquidationPrice is the ground truth that can override it: once that
+# figure has crossed the price this position has to survive to, every remaining
+# accumulate-side rung comes off the book immediately, whatever the projection
+# said (design doc, "Liquidation-aware buy-side cap", point 4).
+
+
+class BreachedLoopClient(LoopClient):
+    """A live long whose reported liquidation price is already above the
+    survival target for zone 1 (2371.26 - 0.2 * the next zone's span = 2271.50)."""
+
+    def get_position_risk(self, symbol=None):
+        return [{
+            "symbol": symbol or "ETHUSDT", "positionAmt": "1.0",
+            "unRealizedProfit": "0.0",
+            "liquidationPrice": "2495.00",
+            "entryPrice": "2500.00", "isolatedWallet": "500.00",
+        }]
+
+
+def test_liquidation_backstop_cancels_remaining_accumulate_rungs(monkeypatch, written):
+    api = BreachedLoopClient(price="2500.00", balance="1000.0")
+    records = run_loop(monkeypatch, written, ticks=1, api=api)
+    assert "error" not in actions(records)
+
+    limits = [(i + 1, p) for i, p in enumerate(api.placed_orders) if p.get("type") == "LIMIT"]
+    buy_ids = [i for i, p in limits if p["side"] == "BUY"]
+    sell_ids = [i for i, p in limits if p["side"] == "SELL"]
+    assert buy_ids and sell_ids  # the ladder really had both sides on it
+
+    assert set(buy_ids).issubset(set(api.cancelled_order_ids))
+    # A cap, not a teardown: the trim side reduces risk and is left resting.
+    assert not set(sell_ids) & set(api.cancelled_order_ids)
+    assert api.cancelled == []  # selective, so NOT cancel_open_orders
+
+
+def test_liquidation_backstop_does_not_fire_while_the_position_is_safe(monkeypatch, written):
+    """The default fixture reports no liquidation price and no position, which
+    must read as 'nothing to guard', not as a breach."""
+    api = LoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, written, ticks=5, api=api)
+    assert api.cancelled_order_ids == []
+
+
 # --- the ladder comes off the book when its zone is left -------------------
 #
 # A resting rung is a live order at a price chosen for ONE zone. Every way of
@@ -639,8 +768,9 @@ def test_a_filled_rung_enters_settling_without_reconciling_the_same_tick(monkeyp
 # position the bot has just decided to be out of.
 #
 # The teardown is ONE request for the whole symbol, never one per rung: these
-# tests therefore count cancel_open_orders calls, and the fake deliberately has
-# no cancel_order at all.
+# tests therefore count cancel_open_orders calls, and assert that the fake's
+# per-id cancel_order - which exists only for the selective reconcile/backstop
+# cases - was never touched.
 
 
 def ladder_order_ids(api):
@@ -686,6 +816,7 @@ def test_the_ladder_is_torn_down_in_one_request_not_one_per_rung(monkeypatch, wr
     rungs = len(first_tick_ladder(monkeypatch))
     assert rungs > 1  # there really were several rungs to take off
     assert len(api.cancelled) == 1  # and exactly one request took them all
+    assert api.cancelled_order_ids == []  # never the per-id loop
 
 
 def test_a_zone_change_decided_as_hold_still_cancels(monkeypatch, written):
