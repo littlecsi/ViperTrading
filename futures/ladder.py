@@ -13,8 +13,10 @@ this module implements.
 """
 
 import math
+from dataclasses import dataclass
 
 from settings import Zone, LONG, SHORT
+from strategy import distance, target_notional, signed
 
 
 def rung_prices(zone: Zone, rung_spacing_pct: float) -> tuple[float, ...]:
@@ -29,3 +31,27 @@ def rung_prices(zone: Zone, rung_spacing_pct: float) -> tuple[float, ...]:
     count = max(1, math.ceil(span / (rung_spacing_pct * zone.resistance)))
     step = span / count
     return tuple(zone.support + step * i for i in range(count + 1))
+
+
+@dataclass(frozen=True)
+class Rung:
+    price: float
+    cumulative_target: float  # signed target notional if price sat here
+
+
+def rung_table(
+    zone: Zone,
+    trend: str,
+    max_n: float,
+    alpha: float,
+    rung_spacing_pct: float,
+) -> tuple[Rung, ...]:
+    """Cumulative signed target at each rung price, reusing strategy.py's
+    existing curve unchanged -- sampled at fixed points instead of
+    continuously. See design doc "Rung table"."""
+    rungs = []
+    for price in rung_prices(zone, rung_spacing_pct):
+        d = distance(price, zone, trend)
+        target = signed(target_notional(d, max_n, alpha), trend)
+        rungs.append(Rung(price=price, cumulative_target=target))
+    return tuple(rungs)
