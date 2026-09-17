@@ -376,6 +376,36 @@ def test_plan_orders_cancels_orders_no_longer_desired():
     assert plan.place == ()
 
 
+def test_plan_orders_leaves_alone_a_tick_rounded_match_on_a_cheap_symbol():
+    """The price half of the match predicate has to respect the tick grid.
+
+    A rung is placed at execution.price_for(raw_price, ...), so what rests on
+    the book differs from the desired price by up to one full tick_size. A
+    purely RELATIVE tolerance is fine while a tick is small next to it (ETH:
+    tick 0.01 against a 0.24 tolerance at 2400) and inverts on a cheap symbol
+    (XRP-like: tick 0.0001 against a 0.00005 tolerance at 0.50), where the
+    rounding alone exceeds the tolerance and every unchanged rung is read as a
+    mismatch - cancelled and re-placed on every single reconcile, which is the
+    exact churn plan_orders exists to avoid."""
+    cheap = Filters(step_size=0.1, min_qty=1.0, min_notional=5.0, tick_size=0.0001)
+    raw_price = 0.50007
+    resting_price = execution.price_for(raw_price, cheap, "BUY")
+    assert resting_price == 0.5  # floored a near-full tick down
+    # The rounding gap alone is bigger than the relative tolerance, which is
+    # what makes this symbol different from ETHUSDT rather than just smaller.
+    assert abs(raw_price - resting_price) > 0.0001 * resting_price
+
+    desired = (ladder.DesiredOrder(price=raw_price, side="BUY", size=20.0),)
+    floored_qty = execution.quantity_for(20.0, raw_price, cheap)
+    open_orders = [{
+        "orderId": 1, "price": str(resting_price), "side": "BUY",
+        "origQty": str(floored_qty),
+    }]
+    plan = ladder.plan_orders(desired, open_orders, cheap)
+    assert plan.cancel == ()
+    assert plan.place == ()
+
+
 def test_plan_orders_leaves_alone_a_lot_step_floored_match_despite_raw_notional_gap():
     # size=100.0 at price=2400.0 floors (via execution.quantity_for) to
     # qty=0.041, i.e. actual notional 98.4 -- a ~1.6% gap from the raw

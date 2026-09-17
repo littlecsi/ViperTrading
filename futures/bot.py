@@ -359,16 +359,18 @@ def _cancel_ladder(api, cfg, ladder_state) -> None:
     One request for the whole symbol (execution.cancel_all_orders), never one
     per tracked id. Every caller here is abandoning the entire ladder, and the
     per-id loop would put nineteen sequential round-trips - this repo's own
-    zone geometry - in front of a flatten that must not wait. Cancelling by
-    symbol also sweeps up rungs this process never tracked, e.g. ones left
-    resting by a crash before their ids were recorded.
+    zone geometry - in front of a flatten that must not wait.
 
     Cancel first, forget second: a raise leaves the ids tracked, so the state
     still says "there is a ladder out there" and a later tick retries.
 
     A no-op when nothing is tracked, so the sticky exit states (HALT every
     tick once price is off the ladder, a dead-band SCALE_OUT on residual dust)
-    cost one request in total rather than one per poll."""
+    cost one request in total rather than one per poll. That guard is also why
+    this is NOT what sweeps up rungs a previous process left resting: on a
+    fresh start nothing is tracked, so it returns before it asks the exchange
+    anything. Crash leftovers are run()'s one-time startup sweep's job, which
+    is unconditional for exactly that reason."""
     if not ladder_state.orders:
         return
     execution.cancel_all_orders(api, cfg.symbol)
@@ -826,6 +828,30 @@ def run() -> None:
         notify.startup_refused(refusal)
         return
 
+    # One-time sweep of anything still resting on the configured symbol, before
+    # the loop can place a rung of its own.
+    #
+    # The ladder's rung->id map lives in memory and dies with the process, so
+    # after a restart - a deploy, a crash, a reboot, the most routine event
+    # there is - the previous run's rungs are still on the book and nothing in
+    # this one knows about them. _cancel_ladder cannot clean them up: it opens
+    # by returning when nothing is tracked, which on a fresh start is always.
+    # The first in-zone tick would then place a COMPLETE second ladder beside
+    # the first: up to double the configured exposure, with the liquidation cap
+    # projecting against only the half it placed, and with the orphans' fills
+    # invisible to _detect_fill (they are not in its tracked set) so they move
+    # the position leaving no order-journal line at all.
+    #
+    # Unconditional, and deliberately not guarded: if the sweep cannot be
+    # confirmed, starting anyway is the one outcome worse than not starting -
+    # this is the only moment the book can be known to be clean, and every
+    # placement after it assumes that it is. A failure here ends startup loudly,
+    # before any order exists, which is recoverable; double exposure on a
+    # leveraged account is not. It runs AFTER the reconciliation refusal above:
+    # a position the bot refuses to adopt is somebody else's trade, and so are
+    # the orders working it.
+    execution.cancel_all_orders(api, cfg.symbol)
+
     active_index = None
     halted = False
     ladder_state = LadderState()
@@ -939,6 +965,35 @@ def run() -> None:
                             print("settings reloaded")
                             reloaded = changes
                     else:
+                        # Every resting rung was priced, sided and sized from
+                        # the config being replaced, and nothing else on the
+                        # tick will re-price them: placement is gated on the
+                        # zone index changing or the tracked set being empty,
+                        # and neither happens on an edit that leaves price in
+                        # the same zone, while reconciliation is only ever
+                        # armed by a detected fill. Since in-zone scaling no
+                        # longer market-orders, no order corrects the position
+                        # either - so a trend flip would take effect on no tick
+                        # at all, leaving the OLD direction's accumulate rungs
+                        # live and still building the position the operator had
+                        # just abandoned. Dropping them here re-arms placement
+                        # (the empty tracked set alone does it) and the next
+                        # tick builds the ladder the new config asks for.
+                        #
+                        # Against the OLD cfg, before it is replaced, for the
+                        # same reason the symbol branch above documents: that is
+                        # where the rungs are actually resting. And before
+                        # set_leverage, which is a change the exchange can
+                        # refuse outright while orders are open on the symbol.
+                        if (
+                            new_cfg.zones != cfg.zones
+                            or new_cfg.trend != cfg.trend
+                            or new_cfg.alpha != cfg.alpha
+                            or new_cfg.exposure_fraction != cfg.exposure_fraction
+                            or new_cfg.rung_spacing_pct != cfg.rung_spacing_pct
+                            or new_cfg.leverage != cfg.leverage
+                        ):
+                            _cancel_ladder(api, cfg, ladder_state)
                         if new_cfg.leverage != cfg.leverage:
                             market.set_leverage(api, new_cfg.symbol, new_cfg.leverage)
                         changes = _config_changes(cfg, new_cfg)

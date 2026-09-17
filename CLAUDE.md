@@ -132,8 +132,16 @@ collection.
 - **One REST call per endpoint per tick** (`market.get_snapshot`: `ticker_price`,
   `get_position_risk`, `balance` — 3 calls, 11 request weight). Every value the tick needs is derived
   from those three payloads by the pure extractors; do not add a second fetch of an endpoint the
-  snapshot already read. At `poll_seconds: 1` the earlier five-call tick cost 21 weight, 1260/min
-  against Binance's 2400/min limit, and being rate limited means an IP ban while holding a leveraged
+  snapshot already read. **The snapshot is no longer the whole tick, though.** Current per-tick
+  budget, re-totalled against the limit-order ladder: **~12 weight in steady state** — 11 for the
+  snapshot plus 1 for `_detect_fill`'s `get_open_orders`, polled on every tick a ladder is resting
+  (there is no fill event to subscribe to). A tick that finds a fill costs **~13 + N** (the detect
+  call, one `query_order` per fill being looked up, and the settling re-snapshot); a settling tick
+  that reconciles is the same shape, its `query_order`s being the pruned rungs. At `poll_seconds: 1`
+  that is roughly **720–840 weight/min against Binance's 2400/min limit — safe, with comfortable
+  headroom.** Re-total this bullet whenever an endpoint is added to the tick: it is what the next
+  change will budget against. Headroom is not a spare-capacity argument — the earlier five-call tick
+  cost 21 weight, 1260/min, and being rate limited means an IP ban while holding a leveraged
   position the bot then cannot flatten. It also narrows the tick from five instants to three - the two
   values taken from the positions payload agree with each other, as do the two from the balances
   payload - but three sequential round-trips are still three moments, so `Snapshot` is **not** an
@@ -257,11 +265,30 @@ collection.
   and querying them after the flatten has gone out, across every exit call site, and no exit call site
   may grow a pre-order round-trip to do it. Do not add a "quick" fix that queries fills before an exit —
   that reintroduces the exact latency the exit path exists to avoid.
+- **`run()` sweeps the symbol once at startup, before the loop** (`execution.cancel_all_orders`, right
+  after the startup reconciliation guard). The rung→id map lives in memory and dies with the process,
+  so after any restart — deploy, crash, reboot — the previous run's rungs are still resting and this
+  one knows nothing about them. `_cancel_ladder` cannot clean them up: it returns early when nothing is
+  tracked, which on a fresh start is always (keep that guard — it is what holds the sticky exit states
+  to one request in total). Without the sweep the first in-zone tick places a *second* complete ladder
+  beside the first: up to double the configured exposure, with the liquidation cap projecting against
+  only the half it placed and `_detect_fill` blind to the orphans' fills, which then move the position
+  with no order-journal line at all. It is deliberately unguarded — a failure ends startup loudly,
+  before any order exists, which is the recoverable outcome; double exposure on a leveraged account is
+  not. It runs *after* the refusal guard: a position the bot refuses to adopt is somebody else's trade,
+  and so are the orders working it.
 - **`settings.json` is re-read every tick** (`bot.py`'s loop calls `settings.load()` each iteration).
   This lets trend, leverage, and the zone ladder change without restarting the bot. An invalid edit
   (caught as `ValueError`/`KeyError`/`OSError`) is logged to the tick journal as a `config_error` and
   otherwise ignored — the prior valid `Settings` stay in force. Never make a settings-load failure
-  fatal to the loop.
+  fatal to the loop. **An applied reload that changes `zones`, `trend`, `alpha`, `exposure_fraction`,
+  `rung_spacing_pct` or `leverage` tears the ladder down first** (`_cancel_ladder`, against the OLD
+  `cfg` — that is where the rungs are resting — and before `set_leverage`, which the exchange can
+  refuse while orders are open). Nothing else would re-price them: placement is gated on the zone index
+  changing or the tracked set being empty, reconciliation is armed only by a detected fill, and in-zone
+  scaling no longer market-orders, so without this a trend flip takes effect on no tick at all and the
+  old direction's accumulate rungs keep building the position the operator just abandoned. The empty
+  tracked set alone re-arms placement, so the next tick rebuilds from scratch.
 - **Zones are contiguous** (one zone's `support` equals the next zone's `resistance`), so `stop_buffer`
   doubles as a hysteresis dead band around zone boundaries (`select_zone` in `strategy.py`). Without it,
   price sitting exactly on a shared boundary would flip the target between maximum and flat on every

@@ -339,7 +339,19 @@ def plan_orders(
     changed (e.g. a shifted liquidation cap) get cancelled and replaced
     rather than mistaken for still current -- it just has to be compared
     post-floor to tell "genuinely changed" apart from "same rung, lot-step
-    rounding noise"."""
+    rounding noise".
+
+    The price tolerance is floored at one tick_size for the same reason the
+    quantity comparison floors the raw notional: what rests on the book is the
+    TICK-ROUNDED price (execution.price_for), which can differ from the desired
+    price by up to a full tick. price_tolerance alone is relative, so it holds
+    on an expensive symbol (ETH: tick 0.01 against a 0.24 tolerance at 2400)
+    and inverts on a cheap one (tick 0.0001 against a 0.00005 tolerance at
+    0.50), where the rounding by itself exceeds the tolerance and every
+    unchanged rung is read as a mismatch -- the whole book cancelled and
+    re-placed on every reconcile, which is precisely the churn this function
+    exists to avoid. max() keeps the relative term wherever it is the larger of
+    the two, so nothing changes for a symbol that was already fine."""
     remaining_desired = list(desired)
     cancel = []
 
@@ -347,11 +359,12 @@ def plan_orders(
         open_price = float(open_order["price"])
         open_side = open_order["side"]
         open_qty = float(open_order["origQty"])
+        tolerance = max(price_tolerance * open_price, filters.tick_size)
         match = next(
             (
                 d for d in remaining_desired
                 if d.side == open_side
-                and abs(d.price - open_price) <= price_tolerance * open_price
+                and abs(d.price - open_price) <= tolerance
                 and abs(execution.quantity_for(d.size, d.price, filters) - open_qty) <= filters.step_size / 2
             ),
             None,

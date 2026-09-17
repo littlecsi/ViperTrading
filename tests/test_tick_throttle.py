@@ -248,7 +248,11 @@ class LoopClient:
         # open.
         self.open_orders_after_tick = open_orders_after_tick or {}
         self._open_orders = []
-        self.cancelled = []  # one symbol per cancel_open_orders call
+        self.cancelled = []  # one symbol per LOOP cancel_open_orders call
+        # run()'s one-time startup sweep, kept apart from the loop's own
+        # teardowns - see cancel_open_orders.
+        self.startup_cancelled = []
+        self._startup_swept = False
         self.cancelled_order_ids = []  # one id per cancel_order call
         # Every id this client took off the book itself, by either route. An
         # id that merely stopped being open is a FILL; one that is in here was
@@ -327,14 +331,30 @@ class LoopClient:
         return {"orderId": orderId, "status": "CANCELED"}
 
     def cancel_open_orders(self, symbol):
-        self.cancelled.append(symbol)
-        self.events.append(("cancel", symbol))
-        if self.cancel_error is not None:
-            error = self.cancel_error(len(self.cancelled))
-            if error:
-                # A cancel that failed took nothing off the book, so the rungs
-                # stay open - which is what makes the retry path testable.
-                raise error
+        """Whole-symbol cancellation, from either of the two callers.
+
+        run()'s startup sweep fires before the loop's first tick, so by
+        construction it is the FIRST such call of any run; it is recorded in
+        `startup_cancelled` rather than `cancelled` so that `cancelled` keeps
+        meaning what every teardown test below reads it as - the whole-symbol
+        cancels the LOOP issued - and so `cancel_error`, which those tests use
+        to drive the failed-teardown and retry paths, keeps its call numbering
+        and stays aimed at the teardown it was written for. The sweep itself is
+        asserted directly, via startup_cancelled."""
+        startup = not self._startup_swept
+        self._startup_swept = True
+        if startup:
+            self.startup_cancelled.append(symbol)
+        else:
+            self.cancelled.append(symbol)
+            self.events.append(("cancel", symbol))
+            if self.cancel_error is not None:
+                error = self.cancel_error(len(self.cancelled))
+                if error:
+                    # A cancel that failed took nothing off the book, so the
+                    # rungs stay open - which is what makes the retry path
+                    # testable.
+                    raise error
         self._cancelled_ids.update(o["orderId"] for o in self._open_orders)
         self._open_orders = []
         return {"code": 200, "msg": "The operation of cancel all open order is done."}
@@ -1619,6 +1639,64 @@ def test_a_symbol_switch_cancels_the_old_symbols_ladder(monkeypatch, written):
 
     # Against the OLD symbol: that is where the rungs are actually resting.
     assert api.cancelled == ["ETHUSDT"]
+
+
+def test_a_previous_processes_ladder_is_swept_before_the_first_tick(monkeypatch, written):
+    """A restart with a live ladder must not put a second one beside it.
+
+    _cancel_ladder is a no-op when nothing is tracked, and on a fresh process
+    nothing is: the rung->id map lives in memory and died with the previous
+    run. So the first in-zone tick used to place a complete new ladder while
+    the previous process's rungs were still resting - double the intended
+    accumulate-side exposure, with the liquidation cap projecting against only
+    the half it placed and _detect_fill blind to the other half's fills (they
+    are not in its tracked set, so they move the position with no order-journal
+    record at all). Restarting is the most routine thing an operator does, so
+    run() sweeps the symbol once before the loop, independently of any tracked
+    state."""
+    api = LoopClient(price="2500.00", balance="1000.0")
+    # A previous process's ladder, as the exchange would still be reporting it.
+    api._open_orders = [
+        {"orderId": 900 + i, "side": "BUY", "price": "2400.00", "origQty": "0.041"}
+        for i in range(19)
+    ]
+    run_loop(monkeypatch, written, ticks=1, api=api)
+
+    fresh = first_tick_ladder(monkeypatch)
+    assert fresh  # the tick really did place a ladder of its own
+    assert api.startup_cancelled == ["ETHUSDT"]  # one sweep, before the loop
+    resting = [o["orderId"] for o in api._open_orders]
+    assert not [i for i in resting if i >= 900]  # no orphan survived it
+    assert len(resting) == len(fresh)  # exactly one ladder on the book, not two
+
+
+def test_a_trend_flip_cancels_the_ladder_priced_for_the_old_direction(monkeypatch, written):
+    """settings.json is re-read every tick precisely so trend and the zones can
+    change without a restart. The rungs are priced for the OLD trend, though,
+    and nothing else re-prices them: placing is gated on the zone index
+    changing or the tracked set being empty (neither happens on a trend flip),
+    and reconciliation is only ever armed by a detected fill. Left alone, the
+    bot runs short with a long-accumulating ladder live on the book, and the
+    next BUY fill builds the position the operator just abandoned. Cancelled
+    against the OLD cfg - that is where the rungs are - so the next tick
+    re-places from scratch."""
+    base = bot.settings.load()
+    flipped = bot.settings.Settings(**{**base.__dict__, "trend": "short"})
+    calls = {"n": 0}
+
+    def load():
+        calls["n"] += 1
+        # Tick 1 rests a long ladder; the flip arrives on tick 2.
+        return base if calls["n"] == 1 else flipped
+
+    api = LoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, written, ticks=2, api=api, load=load)
+
+    first = first_tick_ladder(monkeypatch)
+    assert first  # there was a long-direction ladder to abandon
+    assert api.cancelled == ["ETHUSDT"]  # and the reload took it off the book
+    resting = {o["orderId"] for o in api._open_orders}
+    assert not resting & set(first)  # not one old-direction rung left behind
 
 
 def test_a_failed_cancel_is_retried_rather_than_stranding_the_old_rungs(monkeypatch, written):

@@ -173,6 +173,14 @@ def isolated_wallet_from(positions, symbol: str) -> float:
 def get_snapshot(client, symbol: str, asset: str = "USDT") -> Snapshot:
     """One REST call per endpoint: 3 calls, 11 request weight.
 
+    That is this function's cost, not the tick's. Since the limit-order ladder
+    a tick with rungs resting also pays 1 for _detect_fill's get_open_orders
+    (~12 in steady state), and a tick that finds fills pays ~13 + one
+    query_order per fill looked up. At poll_seconds 1 that is ~720-840/min
+    against Binance's 2400/min limit - see CLAUDE.md's rate-limit bullet, which
+    carries the full per-tick total and is the one to re-check before adding an
+    endpoint here.
+
     At a one-second poll interval the old five-getter tick cost 21 weight
     (1260/min against a 2400/min limit) because /balance and /positionRisk were
     each fetched twice. Beyond the rate-limit headroom, taking every field from
