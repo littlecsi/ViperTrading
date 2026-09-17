@@ -231,8 +231,8 @@ class LoopClient:
         self.margin_type_error = margin_type_error
         self.orders = 0
         self.placed_orders = []
-        self.cancelled = []  # (symbol, orderId) per cancel_order call
-        self.events = []  # ("place", type) / ("cancel", orderId), in call order
+        self.cancelled = []  # one symbol per cancel_open_orders call
+        self.events = []  # ("place", type) / ("cancel", symbol), in call order
         self.margin_type_calls = []
 
     def exchange_info(self):
@@ -276,14 +276,17 @@ class LoopClient:
         # (GET /fapi/v1/openOrders), not the singular `get_open_order`.
         return []
 
-    def cancel_order(self, symbol, orderId):
-        self.cancelled.append((symbol, orderId))
-        self.events.append(("cancel", orderId))
+    # Deliberately NO cancel_order: the ladder teardown must take the whole
+    # symbol off the book in one request, so a regression to the per-id loop
+    # cannot quietly pass these tests - it raises AttributeError instead.
+    def cancel_open_orders(self, symbol):
+        self.cancelled.append(symbol)
+        self.events.append(("cancel", symbol))
         if self.cancel_error is not None:
             error = self.cancel_error(len(self.cancelled))
             if error:
                 raise error
-        return {"orderId": orderId, "status": "CANCELED"}
+        return {"code": 200, "msg": "The operation of cancel all open order is done."}
 
     def new_order(self, **params):
         self.orders += 1
@@ -549,6 +552,10 @@ def test_a_fully_rejected_ladder_still_retries_next_tick(monkeypatch, written):
 # book. Forgetting them (resetting the tracked ids without cancelling) leaves
 # orders nothing supervises, which on the accumulate side can re-open a
 # position the bot has just decided to be out of.
+#
+# The teardown is ONE request for the whole symbol, never one per rung: these
+# tests therefore count cancel_open_orders calls, and the fake deliberately has
+# no cancel_order at all.
 
 
 def ladder_order_ids(api):
@@ -566,10 +573,6 @@ def first_tick_ladder(monkeypatch, position="0.0"):
     return ladder_order_ids(control)
 
 
-def cancelled_ids(api):
-    return [order_id for _symbol, order_id in api.cancelled]
-
-
 def test_a_zone_change_cancels_the_old_zones_ladder(monkeypatch, written):
     """Zone 1 (2371.26-2625.00) activates at 2500 and rests a ladder. Price
     then falls to 2200, past the stop_buffer below that support, so zone 2
@@ -580,8 +583,24 @@ def test_a_zone_change_cancels_the_old_zones_ladder(monkeypatch, written):
 
     first = first_tick_ladder(monkeypatch)
     assert first  # the first tick really did rest a ladder
-    assert cancelled_ids(api) == first
+    assert api.cancelled == ["ETHUSDT"]
     assert len(ladder_order_ids(api)) > len(first)  # and a fresh one replaced it
+
+
+def test_the_ladder_is_torn_down_in_one_request_not_one_per_rung(monkeypatch, written):
+    """Cancelling id by id is one blocking round-trip per rung - 19 of them for
+    this repo's own zone geometry - all of which the exit path has to finish
+    before it can flatten. That burst is also exactly what gets an IP rate
+    limited, and being rate limited while holding a leveraged position the bot
+    then cannot flatten is the worst outcome in the system. The teardown is one
+    DELETE /fapi/v1/allOpenOrders for the whole symbol, whatever the rung
+    count."""
+    api = LoopClient(price="2500.00", balance="1000.0", price_schedule={3: "2200.00"})
+    run_loop(monkeypatch, written, ticks=2, api=api)
+
+    rungs = len(first_tick_ladder(monkeypatch))
+    assert rungs > 1  # there really were several rungs to take off
+    assert len(api.cancelled) == 1  # and exactly one request took them all
 
 
 def test_a_zone_change_decided_as_hold_still_cancels(monkeypatch, written):
@@ -595,7 +614,7 @@ def test_a_zone_change_decided_as_hold_still_cancels(monkeypatch, written):
 
     assert records[-1]["action"] == strategy.HOLD  # not the ladder branch
     assert records[-1]["active_zone_index"] == 2  # but a different zone
-    assert cancelled_ids(api) == first_tick_ladder(monkeypatch)
+    assert api.cancelled == ["ETHUSDT"]
 
 
 def test_stop_out_cancels_the_resting_ladder_before_the_market_order(monkeypatch, written):
@@ -609,7 +628,7 @@ def test_stop_out_cancels_the_resting_ladder_before_the_market_order(monkeypatch
     )
     run_loop(monkeypatch, written, ticks=2, api=api)
 
-    assert cancelled_ids(api) == first_tick_ladder(monkeypatch, position="0.2")
+    assert api.cancelled == ["ETHUSDT"]
     kinds = [kind for kind, _ in api.events]
     assert ("place", "MARKET") in api.events  # the exit itself still crosses
     market_at = api.events.index(("place", "MARKET"))
@@ -627,17 +646,21 @@ def test_halt_cancels_the_resting_ladder_before_flattening(monkeypatch, written)
     records = run_loop(monkeypatch, written, ticks=2, api=api)
 
     assert any(r.get("action") == strategy.HALT for r in records)
-    assert cancelled_ids(api) == first_tick_ladder(monkeypatch, position="0.2")
+    assert api.cancelled == ["ETHUSDT"]
     kinds = [kind for kind, _ in api.events]
     assert kinds.index("cancel") < api.events.index(("place", "MARKET"))
 
 
-def test_a_failed_cancel_does_not_swallow_the_halt_announcement(monkeypatch, written):
-    """`halted` latches so HALT is announced once, not once per poll. A cancel
-    that fails must therefore not have latched it: the flatten did not happen
-    on that tick, and if the latch were already spent the retry a poll later
-    would flatten in total silence - no operator would ever learn the bot's
-    thesis died."""
+def test_a_failing_cancel_never_gates_the_halt_flatten(monkeypatch, written):
+    """The one thing the exit path may never do is fail to flatten.
+
+    A cancel that keeps raising is not exotic here: rate limiting or a network
+    fault is *correlated* with whatever move triggered the HALT. Gated on the
+    cancel, the tick aborted before the market order, `halted` had already
+    latched, and the bot sat on a leveraged position indefinitely with
+    notify.halt never called even once. The cancel is best-effort: it is
+    attempted first, its failure is journalled like any other loop error, and
+    the flatten goes out regardless."""
     from binance.error import ClientError
 
     halts = []
@@ -646,12 +669,14 @@ def test_a_failed_cancel_does_not_swallow_the_halt_announcement(monkeypatch, wri
     api = LoopClient(
         price="2500.00", balance="1000.0", position="0.2",
         price_schedule={3: "1800.00"},
-        cancel_error=lambda n: ClientError(400, -1001, "Internal error", {}) if n == 1 else None,
+        cancel_error=lambda n: ClientError(429, -1003, "Too many requests", {}),
     )
-    run_loop(monkeypatch, written, ticks=3, api=api)
+    records = run_loop(monkeypatch, written, ticks=2, api=api)
 
-    assert halts == [bot.notify.FLATTENED]  # announced on the tick it worked
-    assert ("place", "MARKET") in api.events
+    assert ("place", "MARKET") in api.events  # flattened on THIS tick
+    assert halts == [bot.notify.FLATTENED]  # and said so
+    errors = [r["error"] for r in records if r.get("action") == "error"]
+    assert any("ladder cancel failed" in e for e in errors)  # not swallowed
 
 
 def test_a_symbol_switch_cancels_the_old_symbols_ladder(monkeypatch, written):
@@ -670,9 +695,8 @@ def test_a_symbol_switch_cancels_the_old_symbols_ladder(monkeypatch, written):
     api = LoopClient(price="2500.00", balance="1000.0")
     run_loop(monkeypatch, written, ticks=2, api=api, load=load)
 
-    first = first_tick_ladder(monkeypatch)
-    assert cancelled_ids(api) == first
-    assert {symbol for symbol, _ in api.cancelled} == {"ETHUSDT"}
+    # Against the OLD symbol: that is where the rungs are actually resting.
+    assert api.cancelled == ["ETHUSDT"]
 
 
 def test_a_failed_cancel_is_retried_rather_than_stranding_the_old_rungs(monkeypatch, written):
@@ -689,6 +713,6 @@ def test_a_failed_cancel_is_retried_rather_than_stranding_the_old_rungs(monkeypa
 
     first = first_tick_ladder(monkeypatch)
     assert actions(records)["error"] == 1  # the failure was recorded, not hidden
-    # Every rung was cancelled in the end, the failed one having been retried.
-    assert set(cancelled_ids(api)) == set(first)
+    # Tried on the tick it failed, and again on the next one until it took.
+    assert api.cancelled == ["ETHUSDT", "ETHUSDT"]
     assert len(ladder_order_ids(api)) > len(first)  # and the new zone's ladder went on

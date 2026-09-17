@@ -218,7 +218,7 @@ def _place_ladder(
 
 
 def _cancel_ladder(api, cfg, ladder_state) -> None:
-    """Take the tracked rungs off the book, then forget them.
+    """Take the ladder off the book, then forget it.
 
     Every rung is a live order at a price chosen for ONE zone, so every way of
     leaving that zone has to come through here: the step to the next zone, the
@@ -228,17 +228,22 @@ def _cancel_ladder(api, cfg, ladder_state) -> None:
     supervising them, and on the accumulate side they can fill straight back
     into the position the exit just closed.
 
-    Cancel first, forget second: if cancel_orders raises partway the ids stay
-    tracked, so the next attempt retries the whole set rather than losing the
-    ones it never reached. An id already gone is tolerated inside
-    cancel_orders (-2011), which is what makes that retry safe.
+    One request for the whole symbol (execution.cancel_all_orders), never one
+    per tracked id. Every caller here is abandoning the entire ladder, and the
+    per-id loop would put nineteen sequential round-trips - this repo's own
+    zone geometry - in front of a flatten that must not wait. Cancelling by
+    symbol also sweeps up rungs this process never tracked, e.g. ones left
+    resting by a crash before their ids were recorded.
+
+    Cancel first, forget second: a raise leaves the ids tracked, so the state
+    still says "there is a ladder out there" and a later tick retries.
 
     A no-op when nothing is tracked, so the sticky exit states (HALT every
     tick once price is off the ladder, a dead-band SCALE_OUT on residual dust)
-    cost one cancel pass in total rather than one per poll."""
+    cost one request in total rather than one per poll."""
     if not ladder_state.orders:
         return
-    execution.cancel_orders(api, cfg.symbol, list(ladder_state.orders.values()))
+    execution.cancel_all_orders(api, cfg.symbol)
     ladder_state.reset()
 
 
@@ -587,26 +592,43 @@ def run() -> None:
 
             # Every action that is not the in-zone ladder case is an exit from
             # the zone those rungs were placed for - STOP_OUT, HALT_FLATTEN, or
-            # the dead-band scale-out - so they come off the book first.
+            # the dead-band scale-out - so they come off the book first. Ahead
+            # of the flatten, not after it: an accumulate rung left resting can
+            # fill straight back into the position the flatten just closed, so
+            # cancelling afterwards is a race the bot loses. One request buys
+            # that ordering (see _cancel_ladder).
             #
-            # Before the HALT latch below, and before the `not sending` check,
-            # for two reasons. A HALT whose remaining position is too small to
-            # close still has to cancel, or price leaves the ladder with the
-            # bot's accumulate rungs resting under it and nothing watching what
-            # they fill. And a cancel that fails must not have spent `halted`:
-            # this tick then flattens nothing, and a latched `halted` would make
-            # the retry a poll later flatten in silence, with no HALT ever
-            # announced. Failing here leaves the tick unfinished in every sense,
-            # which is what makes the next one a faithful retry.
+            # BEST EFFORT, and the only _cancel_ladder call site that is. The
+            # flatten is never gated on the cancel succeeding: a cancel can fail
+            # for exactly the reasons that produced the HALT in the first place
+            # - rate limiting, a network fault, an exchange in trouble - and
+            # gated on it, the tick aborted before the market order while
+            # `halted` had already latched, so the bot sat on a leveraged
+            # position indefinitely and never even said HALT. A failed cancel
+            # leaves the rungs tracked, so the next tick tries again; the
+            # position, meanwhile, gets closed NOW.
             #
-            # It does cost an HTTP round-trip ahead of the flatten. That is
-            # accepted deliberately here and nowhere else on this path (the HALT
-            # notification is still sent only AFTER the flatten): an accumulate
-            # rung left resting can fill straight back into the position the
-            # flatten just closed, so cancelling afterwards is a race the bot
-            # loses, while a slow Telegram buys nothing at all.
+            # It also runs before the `not sending` check, because a HALT whose
+            # remaining position is too small to close still has to cancel, or
+            # price leaves the ladder with the bot's accumulate rungs resting
+            # under it and nothing watching what they fill.
             if not in_zone_ladder_case:
-                _cancel_ladder(api, cfg, ladder_state)
+                try:
+                    _cancel_ladder(api, cfg, ladder_state)
+                except Exception as exc:
+                    # Recorded exactly like a loop error - same stream, same
+                    # throttle, same notification - because that is what it is.
+                    # Guarded in turn so that nothing in the reporting (a locked
+                    # journal file, an unencodable message) can do what this
+                    # whole block exists to prevent and stop the flatten.
+                    try:
+                        message = f"ladder cancel failed: {_ascii(exc)}"
+                        if error_log.log(
+                            {"action": "error", "error": message}, key=("error", message)
+                        ):
+                            notify.loop_error(message, symbol=cfg.symbol)
+                    except Exception:
+                        pass
 
             # The transition into HALT, announced once. The NOTIFICATION is not
             # sent here: HALT means price left the ladder in the direction that

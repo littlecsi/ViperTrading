@@ -189,6 +189,26 @@ def cancel_orders(client, symbol: str, order_ids) -> list[dict]:
     return results
 
 
+def cancel_all_orders(client, symbol: str) -> dict:
+    """Cancel EVERY resting order on `symbol`, in one request.
+
+    DELETE /fapi/v1/allOpenOrders: one round-trip and one unit of request
+    weight however many rungs are on the book. cancel_orders() above is one
+    BLOCKING round-trip per order - nineteen of them for this repo's own zone
+    geometry - which is the wrong shape for tearing a ladder down. The exit
+    path pays that latency immediately before a market order that must not
+    wait, and a nineteen-request burst is itself a good way to get rate
+    limited, which per the design notes means an IP ban while holding a
+    leveraged position the bot then cannot flatten.
+
+    Every ladder teardown wants this one: they all abandon the zone's whole
+    order set, none of them keeps some rungs and cancels others. It also
+    sweeps up orders this process never tracked - rungs left resting by a
+    crash before their ids were recorded. cancel_orders() stays for
+    reconciliation, which is the selective case."""
+    return client.cancel_open_orders(symbol=symbol)
+
+
 def query_order_result(client, symbol: str, order_id) -> dict:
     """Raw exchange response for one order, used to tell a filled rung from
     a cancelled one and to extract its fill via fill_from_response()."""

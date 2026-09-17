@@ -208,6 +208,12 @@ class LadderFakeClient(FakeClient):
             raise self.cancel_error
         return {"orderId": orderId, "status": "CANCELED"}
 
+    def cancel_open_orders(self, symbol):
+        self.cancelled.append(symbol)
+        if self.cancel_error is not None:
+            raise self.cancel_error
+        return {"code": 200, "msg": "The operation of cancel all open order is done."}
+
     def query_order(self, symbol, orderId):
         return {"orderId": orderId, "status": "FILLED", "avgPrice": "2400.0",
                 "executedQty": "0.041", "cumQuote": "98.4"}
@@ -257,6 +263,24 @@ def test_cancel_orders_raises_other_errors():
     c = LadderFakeClient(cancel_error=ClientError(400, -1021, "Timestamp", {}))
     with pytest.raises(ClientError):
         execution.cancel_orders(c, "ETHUSDT", [1])
+
+
+def test_cancel_all_orders_is_one_request_for_the_whole_symbol():
+    """Tearing a ladder down must not scale with the rung count: one DELETE
+    /fapi/v1/allOpenOrders, not one blocking round-trip per id."""
+    c = LadderFakeClient()
+    result = execution.cancel_all_orders(c, "ETHUSDT")
+    assert c.cancelled == ["ETHUSDT"]
+    assert result["code"] == 200
+
+
+def test_cancel_all_orders_raises_so_the_caller_can_decide():
+    """No -2011 special case to make here (there are no ids), and no swallowing
+    either: bot.py's exit path wants to journal the failure and flatten anyway,
+    which it can only do if it is told."""
+    c = LadderFakeClient(cancel_error=ClientError(429, -1003, "Too many requests", {}))
+    with pytest.raises(ClientError):
+        execution.cancel_all_orders(c, "ETHUSDT")
 
 
 def test_query_order_result_returns_raw_response():
