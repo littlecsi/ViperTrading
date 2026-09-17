@@ -43,6 +43,11 @@ _API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 _UNKNOWN = "unknown"
 
+# What became of the position on the tick that halted. See format_halt.
+FLATTENED = "flattened"
+FLATTEN_FAILED = "flatten_failed"
+NOT_FLATTENED = "not_flattened"
+
 
 # --- credentials and transport --------------------------------------------
 
@@ -171,6 +176,20 @@ def _known(text: str) -> bool:
     return text != _UNKNOWN
 
 
+def _safe_text(value, limit: int = 200) -> str:
+    """Text the bot did not write - an exchange or OS error message - made fit
+    to put in a notification.
+
+    Redacted (an exception raised anywhere near this module can carry the
+    request URL, and the token with it), forced to ASCII so that every message
+    this module produces is ASCII whatever the OS locale hands over, and
+    clipped so a stray HTML error page cannot become the notification."""
+    text = _redact(str(value)).encode("ascii", "replace").decode("ascii")
+    if len(text) > limit:
+        text = text[:limit] + "..."
+    return text
+
+
 # --- formatters ------------------------------------------------------------
 #
 # Pure: plain values in, one string out. No network, no clock, no config. That
@@ -240,26 +259,95 @@ def format_halt(
     leverage: int,
     position_amt: float,
     position_notional: float,
-    flattening: bool,
+    outcome: str = NOT_FLATTENED,
+    record: dict | None = None,
+    side: str | None = None,
+    quantity: float | None = None,
+    error=None,
 ) -> str:
     """Message for the tick that halts: price has left the zone ladder.
 
     The one an unattended operator would most regret missing - after this the
-    bot flattens and stops scaling, and nothing else raises an alarm."""
+    bot stops scaling, and nothing else raises an alarm.
+
+    Sent AFTER the flatten has been attempted, never before it. HALT means
+    price left the ladder in the direction that kills the thesis, and the
+    flatten IS the response to that; a hanging Telegram must not hold a market
+    order on a leveraged position for even one tick. Waiting also makes the
+    message strictly better, because it can say what became of the position
+    rather than only that the bot decided to get out.
+
+    `outcome` selects which of the three things happened, and only the
+    arguments for that branch need to be supplied:
+      FLATTENED      - the exit filled; pass the order-journal `record`.
+      FLATTEN_FAILED - execute() raised; pass `side`, `quantity`, `error`.
+      NOT_FLATTENED  - no order went out at all."""
+    context = [f"{symbol} at {_num(price)}", f"{trend} {leverage}x"]
+
+    if outcome == FLATTEN_FAILED:
+        # The most urgent message this bot can send: it concluded the thesis
+        # was dead, tried to get out, and could not. The position is still on.
+        return "\n".join(
+            [
+                "HALT - FLATTEN FAILED",
+                "The exit order was REJECTED.",
+                *context,
+                f"still open: {_trim(position_amt)} ({_num(position_notional)} USDT)",
+                f"tried: {side} {_trim(quantity)}",
+                f"error: {_safe_text(error)}",
+                "",
+                "The bot retries every poll. Check the position NOW.",
+            ]
+        )
+
+    if outcome == FLATTENED:
+        filled = record or {}
+        return "\n".join(
+            [
+                "HALT - FLATTENED",
+                "Price left the zone ladder; the position is closed.",
+                *context,
+                f"{filled.get('side', _UNKNOWN)} {_trim(filled.get('quantity'))} at "
+                f"{_num(filled.get('fill_price'))}",
+                f"fill notional: {_num(filled.get('notional'))} USDT",
+                f"position: {_trim(filled.get('position_before'))} -> "
+                f"{_trim(filled.get('position_after'))}",
+                "",
+                "No further scaling while price is off the ladder.",
+            ]
+        )
+
     lines = [
         "HALT - price left the zone ladder",
-        f"{symbol} at {_num(price)}",
-        f"{trend} {leverage}x",
+        *context,
         f"position: {_trim(position_amt)} ({_num(position_notional)} USDT)",
     ]
-    if flattening:
-        lines.append("flattening now")
-    elif position_amt:
+    if position_amt:
         # Sized below the exchange minimum, so it cannot be closed by this bot.
         lines.append("position left open: too small to close")
     else:
         lines.append("no position to flatten")
     lines.append("No further scaling while price is off the ladder.")
+    return "\n".join(lines)
+
+
+def format_loop_error(message, symbol=None) -> str:
+    """Message for a fault the loop absorbed and journalled.
+
+    Worth pushing because the loop survives these by design, so a bot wedged
+    on one looks perfectly healthy from outside: with exposure_fraction at 1.0
+    the required margin exceeds the wallet as d approaches 1, Binance rejects
+    with -2019, and the bot retries every second - holding a leveraged
+    position - for as long as that lasts."""
+    lines = ["BOT ERROR"]
+    if symbol:
+        lines.append(str(symbol))
+    lines += [
+        _safe_text(message),
+        "",
+        "The loop is still running. An identical repeat is",
+        "notified at most once a minute.",
+    ]
     return "\n".join(lines)
 
 
@@ -323,8 +411,19 @@ def order_executed(record: dict) -> bool:
 
 def halt(**values) -> bool:
     """Call on the TRANSITION into HALT only - every tick decides HALT for as
-    long as price stays off the ladder."""
+    long as price stays off the ladder - and only once the flatten has been
+    attempted, so the message can report what became of the position."""
     return _notify(format_halt, **values)
+
+
+def loop_error(message, symbol=None) -> bool:
+    """Call only where the loop's error record was actually WRITTEN.
+
+    That reuses the error journal's own throttle state instead of adding a
+    second one: a new, distinct failure notifies the instant it happens, and
+    an identical repeat - a rejected order recurring every poll - collapses to
+    one message a minute rather than one per poll."""
+    return _notify(format_loop_error, message, symbol=symbol)
 
 
 def startup_refused(record: dict) -> bool:

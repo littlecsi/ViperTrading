@@ -146,9 +146,10 @@ collection.
   carrying the changed fields as `{field: [old, new]}`). Under the throttle the next tick record can be
   up to a minute away, so without this the journal cannot say when an edit actually took effect. It is
   the counterpart to `config_refused`; keep both.
-- **Telegram notifications may never affect trading** (`futures/notify.py`). Four events are pushed:
+- **Telegram notifications may never affect trading** (`futures/notify.py`). Five events are pushed:
   every executed order (never throttled — fills are rare and each moves real money), the transition
-  into `HALT`, `startup_refused`, and `config_refused`. Three rules hold this together. (1) *It cannot
+  into `HALT`, `startup_refused`, `config_refused`, and every loop `error` record the throttle lets
+  through. Three rules hold this together. (1) *It cannot
   raise into the loop*: `send()` and every event entry point swallow `Exception` and return a bool, and
   the failure path is itself guarded and forced to ASCII — an f-string of a localised `OSError` on a
   `cp949` console is how the bot was killed once before. (2) *It cannot stall the loop*: every request
@@ -156,10 +157,19 @@ collection.
   (3) *It disappears when unconfigured*: credentials are read with `getattr(config, ..., None)`, and
   absent or empty means silently off — no warning, no log line. Notifications are sent **after** the
   corresponding journal write and formatted from the same record, so a Telegram problem can never cost
-  an order-journal line and the message can never disagree with the audit trail. Sticky states notify
-  on the transition, reusing the loop state that already exists for that (`halted` for `HALT`, the
-  `announce`/`refused_cfg` dedupe for `config_refused`) rather than adding a second throttle — note
-  `TickLog` is not reusable here, it writes to `journal.log_tick` itself.
+  an order-journal line and the message can never disagree with the audit trail. **The HALT
+  notification is sent after the flatten has been attempted, never before it** — the flatten is the
+  response to an adverse move and must not wait on an HTTP call — and it reports the outcome
+  (`notify.FLATTENED` / `FLATTEN_FAILED` / `NOT_FLATTENED`); the failed-flatten case is notified from
+  the `except` around `execution.execute` and before the re-raise, because by the next tick `halted`
+  has latched and nothing would ever say a HALT happened. Sticky states notify on the transition,
+  reusing the loop state that already exists for that (`halted` for `HALT`, the
+  `announce`/`refused_cfg` dedupe for `config_refused`, and the *return value* of `error_log.log` for
+  loop errors) rather than adding a second throttle — note `TickLog` is not reusable here, it writes
+  to `journal.log_tick` itself. Exchange/OS text that goes into a message passes through
+  `notify._safe_text` (redacted, forced to ASCII, clipped). The whole test suite is barred from
+  sending by an autouse fixture in `tests/conftest.py`; keep it that way when adding tests that drive
+  `bot.run()`.
 - **Order quantities floor to the lot step, never round up** (`execution.quantity_for` uses
   `math.floor`). Rounding up would let the bot exceed its own exposure cap on the last partial step of a
   fill — flooring is the only direction that cannot overshoot.

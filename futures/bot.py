@@ -399,25 +399,33 @@ def run() -> None:
                 _sleep(cfg.poll_seconds)
                 continue
 
-            if decision.action == strategy.HALT and not halted:
+            # The transition into HALT, announced once. The NOTIFICATION is not
+            # sent here: HALT means price left the ladder in the direction that
+            # kills the thesis, the flatten below is the response to that, and
+            # a hanging Telegram must not hold that market order for even one
+            # tick. Every exit from this tick therefore notifies for itself,
+            # and `halt_context` is what each of those calls says about where
+            # the position stood when the halt was decided.
+            halting = decision.action == strategy.HALT and not halted
+            halt_context = None
+            if halting:
                 print(f"HALT - price {price} left the zone ladder")
                 halted = True
-                # On the transition only, and after this tick's journal write.
-                # Sent before the flattening order rather than after it: if
-                # execute() raises, the halt is still the thing the operator
-                # most needs to hear about, and by then `halted` would have
-                # latched and no later tick would say it.
-                notify.halt(
-                    symbol=cfg.symbol,
-                    price=price,
-                    trend=cfg.trend,
-                    leverage=cfg.leverage,
-                    position_amt=position_amt,
-                    position_notional=position_notional,
-                    flattening=sending,
-                )
+                halt_context = {
+                    "symbol": cfg.symbol,
+                    "price": price,
+                    "trend": cfg.trend,
+                    "leverage": cfg.leverage,
+                    "position_amt": position_amt,
+                    "position_notional": position_notional,
+                }
 
             if not sending:
+                if halting:
+                    # Nothing to send: either the position is already flat, or
+                    # what is left of it is below the exchange minimum and this
+                    # bot cannot close it at all.
+                    notify.halt(outcome=notify.NOT_FLATTENED, **halt_context)
                 active_index = decision.zone_index
                 _sleep(cfg.poll_seconds)
                 continue
@@ -432,7 +440,24 @@ def run() -> None:
             reduce_only = execution.should_reduce_only(
                 decision.reason, decision.delta, position_notional
             )
-            result = execution.execute(api, cfg.symbol, side, qty, reduce_only=reduce_only)
+            try:
+                result = execution.execute(api, cfg.symbol, side, qty, reduce_only=reduce_only)
+            except Exception as exc:
+                # The bot decided its thesis was dead, tried to get out, and
+                # could not. That is the most urgent thing it can say, and it
+                # cannot wait for the handler at the bottom of the loop: by the
+                # next tick `halted` has latched, so nothing would ever say a
+                # HALT had happened at all. Notified here, then re-raised so
+                # the error is journalled exactly as any other failed order.
+                if halting:
+                    notify.halt(
+                        outcome=notify.FLATTEN_FAILED,
+                        side=side,
+                        quantity=qty,
+                        error=exc,
+                        **halt_context,
+                    )
+                raise
 
             # The order is live on the exchange from here. Everything below is
             # bookkeeping, and a failure in it must not lose the fill record or
@@ -491,6 +516,10 @@ def run() -> None:
                 # notification problem can never cost an order-journal line.
                 # Never throttled - every fill moves real money.
                 notify.order_executed(record)
+                if halting:
+                    # The exit went through. Same record, so the alarm and the
+                    # receipt cannot disagree about what closed the position.
+                    notify.halt(outcome=notify.FLATTENED, record=record, **halt_context)
             finally:
                 active_index = decision.zone_index
 
@@ -516,9 +545,17 @@ def run() -> None:
             # the instant it happens; only an identical repeat collapses.
             try:
                 message = _ascii(exc)
-                error_log.log(
+                written = error_log.log(
                     {"action": "error", "error": message}, key=("error", message)
                 )
+                # Notified on exactly the ticks the record was WRITTEN, which
+                # reuses the throttle above instead of adding a second one: a
+                # new, distinct failure pushes the instant it happens, while
+                # the -2019 that repeats every poll collapses to one message a
+                # minute. A bot wedged retrying a rejected order while holding
+                # a leveraged position is invisible from outside without this.
+                if written:
+                    notify.loop_error(message, symbol=cfg.symbol)
             except Exception:
                 pass
             try:

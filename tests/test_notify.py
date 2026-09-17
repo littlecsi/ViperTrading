@@ -53,18 +53,12 @@ class Response:
 
 @pytest.fixture(autouse=True)
 def credentials(monkeypatch):
-    """Fake credentials everywhere, so no test can reach the real chat."""
+    """Fake credentials, so these tests see notify ENABLED without being able
+    to reach the real chat. The suite-wide conftest fixture has already hidden
+    the real ones and made requests.post raise; this only swaps in fakes on top
+    of that, and the forbidden post stays in force unless a test asks for the
+    `posts` fixture."""
     monkeypatch.setattr(notify, "config", FakeConfig())
-
-
-@pytest.fixture(autouse=True)
-def no_network(monkeypatch):
-    """Any unposted test that reaches the network fails loudly."""
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("a unit test tried to call the network")
-
-    monkeypatch.setattr(notify.requests, "post", forbidden)
 
 
 @pytest.fixture
@@ -237,7 +231,7 @@ def halt_values(**overrides):
         "leverage": 5,
         "position_amt": 8.559,
         "position_notional": 15427.59,
-        "flattening": True,
+        "outcome": notify.NOT_FLATTENED,
     }
     values.update(overrides)
     return values
@@ -264,6 +258,24 @@ def all_messages():
         notify.format_order(order_record()),
         notify.format_order(order_record(fill_price=2395.06, notional=2098.07, reduce_only=True)),
         notify.format_halt(**halt_values()),
+        notify.format_halt(
+            **halt_values(
+                outcome=notify.FLATTENED,
+                record=order_record(
+                    side="SELL", quantity=8.559, fill_price=1802.4, notional=15426.73,
+                    position_before=8.559, position_after=0.0,
+                ),
+            )
+        ),
+        notify.format_halt(
+            **halt_values(
+                outcome=notify.FLATTEN_FAILED,
+                side="SELL",
+                quantity=8.559,
+                error=RuntimeError("-2019 Margin is insufficient"),
+            )
+        ),
+        notify.format_loop_error("-2019 Margin is insufficient", symbol="ETHUSDT"),
         notify.format_startup_refused(refusal_record()),
         notify.format_config_refused(
             {"reason": "testnet_change_requires_restart", "current_testnet": True,
@@ -333,16 +345,79 @@ def test_order_message_survives_a_record_full_of_holes():
     notify.format_order({"quantity": "n/a", "position_after": None, "mark_price": "x"})
 
 
-def test_halt_message_states_what_the_bot_is_doing_about_the_position():
-    assert "flattening now" in notify.format_halt(**halt_values())
+def test_halt_message_says_no_order_went_out_and_why():
     assert "no position to flatten" in notify.format_halt(
-        **halt_values(position_amt=0.0, position_notional=0.0, flattening=False)
+        **halt_values(position_amt=0.0, position_notional=0.0)
     )
     # Residual dust below the exchange minimum: decide() says SCALE_OUT/HALT
     # forever and is_executable rejects it every time, so nothing is sent.
     assert "too small to close" in notify.format_halt(
-        **halt_values(position_amt=0.0001, position_notional=0.18, flattening=False)
+        **halt_values(position_amt=0.0001, position_notional=0.18)
     )
+
+
+def test_halt_message_reports_the_completed_flatten():
+    """The message waits for the flatten, so it can say what became of the
+    position instead of only that the bot decided to get out."""
+    text = notify.format_halt(
+        **halt_values(
+            outcome=notify.FLATTENED,
+            record=order_record(
+                side="SELL", quantity=8.559, fill_price=1802.4, notional=15426.73,
+                position_before=8.559, position_after=0.0,
+            ),
+        )
+    )
+    assert text.startswith("HALT - FLATTENED")
+    assert "SELL 8.559 at 1,802.40" in text
+    assert "fill notional: 15,426.73 USDT" in text
+    assert "position: 8.559 -> 0" in text
+
+
+def test_halt_message_shouts_when_the_flatten_failed():
+    """The single most urgent message the bot can send: thesis dead, exit
+    attempted, exit refused, position still on."""
+    text = notify.format_halt(
+        **halt_values(
+            outcome=notify.FLATTEN_FAILED,
+            side="SELL",
+            quantity=8.559,
+            error=RuntimeError("-2019 Margin is insufficient"),
+        )
+    )
+    assert text.startswith("HALT - FLATTEN FAILED")
+    assert "REJECTED" in text
+    assert "still open: 8.559 (15,427.59 USDT)" in text
+    assert "tried: SELL 8.559" in text
+    assert "error: -2019 Margin is insufficient" in text
+    assert "Check the position NOW." in text
+
+
+def test_halt_failure_message_redacts_and_clips_the_error():
+    text = notify.format_halt(
+        **halt_values(
+            outcome=notify.FLATTEN_FAILED,
+            error=OSError(f"url: /bot{TOKEN}/sendMessage " + "x" * 500),
+        )
+    )
+    assert TOKEN not in text
+    assert "<token>" in text
+    assert len(text) < 600  # a stray HTML error page cannot become the message
+
+
+def test_loop_error_message_names_the_symbol_and_says_the_bot_is_alive():
+    text = notify.format_loop_error("-2019 Margin is insufficient", symbol="ETHUSDT")
+    assert text.startswith("BOT ERROR\nETHUSDT")
+    assert "-2019 Margin is insufficient" in text
+    assert "still running" in text
+    assert "once a minute" in text  # so a repeat is not read as a new failure
+
+
+def test_loop_error_message_forces_ascii():
+    """The exception text comes from the OS or the exchange, and on this
+    machine it can arrive localised."""
+    text = notify.format_loop_error(LOCALISED_ERROR)
+    text.encode("ascii")
 
 
 def test_startup_refused_message_distinguishes_the_two_reasons():
@@ -379,6 +454,118 @@ def written(monkeypatch):
     records = []
     monkeypatch.setattr(journal, "log_tick", lambda record, log_dir=None: records.append(record))
     return records
+
+
+@pytest.fixture
+def events(monkeypatch):
+    """One ordered log of orders placed and messages sent, so a test can assert
+    that the money path ran FIRST."""
+    log = []
+    monkeypatch.setattr(notify, "send", lambda text: log.append(("notify", text)) or True)
+    return log
+
+
+class Holding(loop.LoopClient):
+    """A client that already holds a position, for the flatten paths.
+
+    1.0 ETH at 1500 is 1500 USDT against a 5000 cap, so the startup
+    reconciliation guard lets the bot start; 1500 is below the ladder, so the
+    first tick halts."""
+
+    def __init__(self, events=None, amt="1.0", order_error=None):
+        super().__init__(price="1500.00", balance="1000.0", order_error=order_error)
+        self.amt = amt
+        self.events = [] if events is None else events
+
+    def get_position_risk(self, symbol=None):
+        return [{"symbol": "ETHUSDT", "positionAmt": self.amt, "unRealizedProfit": "0.0"}]
+
+    def new_order(self, **params):
+        # Logged BEFORE the (possibly raising) call: what is being asserted is
+        # that the attempt happened, and that it happened first.
+        self.events.append(("order", params.get("side")))
+        result = super().new_order(**params)
+        self.amt = "0.0"
+        return {**result, "avgPrice": "1500.00", "executedQty": "1.0", "cumQuote": "1500.00"}
+
+
+def messages(events):
+    return [text for kind, text in events if kind == "notify"]
+
+
+def test_a_flatten_is_placed_before_anything_is_notified(monkeypatch, written, events):
+    """The ordering the money path depends on: HALT is the response to an
+    adverse move, so the exit order goes out first and the message reports it
+    afterwards. A hanging Telegram cannot cost a tick of slippage."""
+    api = Holding(events=events)
+    drive(monkeypatch, api, ticks=2)
+
+    assert [kind for kind, _ in events][0] == "order"
+    sent = messages(events)
+    assert sent[0].startswith("ORDER FILLED")  # the receipt, never throttled
+    assert sent[1].startswith("HALT - FLATTENED")  # the alarm, with the outcome
+    assert "SELL 1 at 1,500.00" in sent[1]
+    assert "position: 1 -> 0" in sent[1]
+    assert len(sent) == 2  # the halt does not repeat on the next tick
+
+
+def test_a_failed_flatten_is_attempted_first_and_then_shouted_about(monkeypatch, written, events):
+    """execute() raising must not skip the notification: by the next tick
+    `halted` has latched, so nothing would ever say a HALT had happened."""
+    api = Holding(events=events, order_error=lambda n: "-2019 Margin is insufficient")
+    drive(monkeypatch, api, ticks=2)
+
+    assert [kind for kind, _ in events][0] == "order"
+    assert api.orders == 2  # it kept trying after the failure
+    sent = messages(events)
+    assert sent[0].startswith("HALT - FLATTEN FAILED")
+    assert "still open: 1 (1,500.00 USDT)" in sent[0]
+    assert "tried: SELL 1" in sent[0]
+    assert "-2019 Margin is insufficient" in sent[0]
+    # The generic loop-error push follows from the same exception, then the
+    # identical repeat on the next tick is throttled away.
+    assert [text.split("\n")[0] for text in sent] == ["HALT - FLATTEN FAILED", "BOT ERROR"]
+
+
+def test_a_dead_notifier_does_not_hold_up_the_flatten(monkeypatch, written):
+    monkeypatch.setattr(notify, "send", raiser(OSError("telegram is down")))
+    orders = []
+    monkeypatch.setattr(journal, "log_order", lambda record, log_dir=None: orders.append(record))
+
+    api = Holding()
+    drive(monkeypatch, api, ticks=2)
+
+    assert api.orders == 1  # placed, and the position is flat afterwards
+    assert orders[0]["reason"] == "halt_flatten"
+    assert orders[0]["position_after"] == 0.0
+
+
+def test_a_repeating_failure_notifies_once_per_interval_not_once_per_poll(
+    monkeypatch, written, sent
+):
+    """-2019 repeats on every poll once required margin exceeds the wallet -
+    which is where exposure_fraction 1.0 puts the strategy at its largest. The
+    bot is wedged retrying while holding a leveraged position, and looks
+    healthy from outside; one message a minute says so without 300 of them."""
+    api = loop.LoopClient(balance="1000.0", order_error=lambda n: "-2019 Margin is insufficient")
+    loop.run_loop(monkeypatch, written, ticks=300, api=api)
+
+    records = [r for r in written if r.get("action") == "error"]
+    pushed = [text for text in sent if text.startswith("BOT ERROR")]
+    assert api.orders == 300  # the bot kept trying, as it should
+    assert len(records) == len(pushed) == 5  # exactly one message per record
+
+
+def test_a_distinct_failure_notifies_the_instant_it_happens(monkeypatch, written, sent):
+    api = loop.LoopClient(
+        balance="1000.0",
+        order_error=lambda n: "-2019 Margin is insufficient" if n <= 90 else "-1021 Timestamp",
+    )
+    loop.run_loop(monkeypatch, written, ticks=95, api=api)
+
+    pushed = [text for text in sent if text.startswith("BOT ERROR")]
+    assert len(pushed) == 3  # first failure, 60s later, then the new one
+    assert "-1021 Timestamp" in pushed[-1]  # the tick it changed, not 60s after
 
 
 def test_every_fill_notifies_exactly_once_never_throttled(monkeypatch, written, sent):
