@@ -14,37 +14,58 @@ falls toward 0 and the target shrinks with it. Breaking out of a zone entirely f
 steps to the next zone in the ladder.
 
 The active system lives in `futures/`:
-- `futures/settings.py` — `Settings`/`Zone` dataclasses and a validating `load()`.
+- `futures/settings.py` — `Settings`/`Zone` dataclasses and a validating `load()`. Two fields exist
+  only for the ladder: `rung_spacing_pct` (rung spacing as a fraction of resistance, see
+  `ladder.rung_prices`) and `liquidation_buffer_pct` (the safety margin `ladder.survival_price` applies
+  beyond the next zone). Both are hot-reloaded like every other field, so both are validated the same
+  way (`(0, 1)` / `[0, 1)`) rather than trusted as startup-only constants.
 - `futures/settings.json` — runtime config (symbol, trend, leverage, alpha, exposure fraction,
-  rebalance threshold, stop buffer, poll interval, testnet flag, zone ladder). Re-read every tick — see
-  architecture notes below.
+  rebalance threshold, stop buffer, poll interval, testnet flag, rung spacing, liquidation buffer, zone
+  ladder). Re-read every tick — see architecture notes below.
 - `futures/client.py` — `build(testnet)` constructs the Binance `UMFutures` client; also measures the
   offset between this machine's clock and Binance's server clock at startup and patches
   `binance.api.get_timestamp` with it.
 - `futures/market.py` — exchange reads: `get_snapshot()` returns a frozen `Snapshot` (mark price,
-  signed position amount, unrealized PnL, wallet balance, available balance) from one call per
-  endpoint, built out of pure extractors (`wallet_balance_from`, `available_balance_from`,
-  `position_amt_from`, `unrealized_pnl_from`) that take an already-fetched payload. Also
-  `get_position_amt()` for a one-symbol read outside the tick snapshot, `get_filters()` (lot step, min
-  qty, min notional), and `set_leverage()`.
+  signed position amount, unrealized PnL, wallet balance, available balance, entry price, isolated
+  wallet, liquidation price) from one call per endpoint, built out of pure extractors
+  (`wallet_balance_from`, `available_balance_from`, `position_amt_from`, `unrealized_pnl_from`,
+  `entry_price_from`, `isolated_wallet_from`, `liquidation_price_from`) that take an already-fetched
+  payload — the three ladder-only fields ride along on the same position-risk payload `position_amt`
+  already reads, so they cost no extra call and share its instant exactly. Also `get_position_amt()`
+  for a one-symbol read outside the tick snapshot, `get_filters()` (lot step, min qty, min notional,
+  tick size), `get_open_orders()` (polled every tick a ladder is live, to detect fills by diffing
+  against tracked rung ids), `get_leverage_brackets()` (the maintenance-margin bracket table, fetched
+  once at startup/symbol-switch and turned into a `MarginTier` by `maintenance_tier_from()`),
+  `set_leverage()`, and `set_margin_type()` (best-effort switch to ISOLATED margin, tolerating both
+  "already set" and "position already open" as non-fatal).
 - `futures/strategy.py` — pure decision logic. `decide()` takes plain values and returns a `Decision`;
   see architecture notes for why this module has no I/O.
-- `futures/execution.py` — quantity flooring to the lot step, exchange filter checks, and market-order
-  placement.
+- `futures/ladder.py` — pure limit-order-ladder computation, the counterpart to `strategy.py` for
+  in-zone `SCALE_IN`/`SCALE_OUT`: it turns `strategy.py`'s continuous target curve into a discrete set
+  of resting rung orders (`rung_table`, `build_rung_orders`, `desired_orders`), the liquidation-aware
+  cap on the accumulate side (`liquidation_scale`, `survival_price`, `apply_liquidation_cap`), and the
+  order-book diff that minimizes churn on reconciliation (`plan_orders`). No I/O, no client, no clock,
+  for the same reason `strategy.py` has none — see architecture notes and
+  `docs/superpowers/specs/2026-09-17-limit-order-ladder-design.md` for the full derivation.
+- `futures/execution.py` — quantity flooring to the lot step, exchange filter checks, market- and
+  limit-order placement (`place_limit_order`), side-aware price rounding to the tick size (`price_for`),
+  and order cancellation/lookup (`cancel_orders`, `cancel_all_orders`, `query_order_result`).
 - `futures/journal.py` — two JSONL logs under `futures/logs/` (gitignored): `ticks-YYYY-MM-DD.jsonl`
   (one line per record the loop hands it — a repeated state is written at most once per interval, see
   architecture notes below; `journal.py` writes, it does not decide) and `orders-YYYY-MM-DD.jsonl` (one
   line per executed order, carrying a full environment snapshot at fill time).
 - `futures/notify.py` — Telegram push notifications: `enabled()`, `send()`, one pure formatter per
-  event (`format_order`, `format_halt`, `format_startup_refused`, `format_config_refused`) and the
-  event entry points `bot.py` calls (`order_executed`, `halt`, `startup_refused`, `config_refused`).
-  Formatting and sending only — no trading logic, no decisions. Every entry point returns a bool and
-  swallows `Exception`, so a notification failure can never reach the loop; see architecture notes.
-- `futures/bot.py` — the polling loop (entry point). Owns only five pieces of mutable state across
-  iterations: `active_index` (which zone is currently being worked), `halted` (whether the
-  HALT-left-the-ladder notice has already been announced, and re-armed once price returns to the
-  ladder), `refused_cfg` (the settings edit whose reload was last refused), and one `TickLog` per
-  journal record stream — `tick_log`, `config_log`, `error_log`.
+  event (`format_order`, `format_halt`, `format_startup_refused`, `format_config_refused`,
+  `format_liquidation_brake`) and the event entry points `bot.py` calls (`order_executed`, `halt`,
+  `startup_refused`, `config_refused`, `liquidation_brake`). Formatting and sending only — no trading
+  logic, no decisions. Every entry point returns a bool and swallows `Exception`, so a notification
+  failure can never reach the loop; see architecture notes.
+- `futures/bot.py` — the polling loop (entry point). Owns the loop's mutable state across iterations:
+  `active_index` (which zone is currently being worked), `halted` (whether the HALT-left-the-ladder
+  notice has already been announced, and re-armed once price returns to the ladder), `refused_cfg` (the
+  settings edit whose reload was last refused), a `LadderState` instance (the resting-order lifecycle
+  for the currently active zone — see architecture notes), and one `TickLog` per journal record stream
+  — `tick_log`, `config_log`, `error_log`.
 
 `binance/` (`binance/main.py`, `binance/biat.py`) is the **legacy Spot bot** — a volatility-breakout
 strategy for Spot XRP/USDT with Slack alerting. It is retained for reference but is **out of scope and
@@ -173,6 +194,62 @@ collection.
 - **Order quantities floor to the lot step, never round up** (`execution.quantity_for` uses
   `math.floor`). Rounding up would let the bot exceed its own exposure cap on the last partial step of a
   fill — flooring is the only direction that cannot overshoot.
+- **In-zone scaling rests as limit orders; every exit stays a market order** (`bot.run`'s
+  `in_zone_ladder_case`). `SCALE_IN`/`SCALE_OUT` decided *inside* the active zone
+  (`decision.zone_index is not None`) route through `ladder.py`/`_place_ladder`/`_reconcile_ladder` and
+  `execution.place_limit_order` — a rung ladder resting on the book instead of crossing the spread every
+  tick. `STOP_OUT`, `HALT_FLATTEN`, and the dead-band `SCALE_OUT` (`decision.zone_index is None`) are
+  unchanged from before the ladder existed: they still go through `execution.execute` (market). The
+  split is deliberate — an exit is the tick the bot decided the position must change size *now*, where
+  certainty of execution matters more than price, while in-zone scaling has no such urgency and can
+  afford to wait at its own limit price. Never route an exit through the ladder (it can't guarantee a
+  fill before the next tick), and never give in-zone scaling a market order "for speed" — that
+  reintroduces the exact spread cost the ladder exists to save.
+- **The ladder's lifecycle is poll-detect-settle-reconcile, not fill-driven** (`bot.py`'s `LadderState`,
+  `_place_ladder`, `_detect_fill`, `_reconcile_ladder`). There is no fill event to subscribe to:
+  `_detect_fill` diffs the tracked rung-price -> order-id map against `market.get_open_orders` every
+  tick a ladder is live, so a rung leaving the book is discovered up to one `poll_seconds` late, and
+  looks identical whether it filled or was cancelled out from under the bot (only `query_order_result`
+  tells the two apart, in `_journal_ladder_fill`). A detected departure does not trigger an immediate
+  rebuild — reconciling mid-cascade would price a whole new ladder off a position still in the middle of
+  filling, once per poll for as long as the move lasts. Instead the detecting tick only journals the
+  departed rung (`_log_ladder_fills`) and arms `ladder_state.settling` with a snapshot of the open-order
+  id set; later ticks re-snapshot for as long as that set keeps changing, and only a tick that finds it
+  *unchanged* since the wait began runs `_reconcile_ladder`, which rebuilds the ladder as a minimal diff
+  (`ladder.plan_orders`) against the position the fills actually left behind, not a blind cancel/replace.
+  `_place_ladder` is the one step with no fill history to reconcile against, so it only runs on zone
+  activation — first entry into a zone, or the tick after a zone change or a market-order flatten emptied
+  the tracked set — never to patch a partially-filled ladder back up.
+- **The liquidation cap is a projection with a ground-truth override, not just a projection**
+  (`ladder.liquidation_scale`/`survival_price` vs. `bot._liquidation_breached`). Every placement or
+  reconcile computes a safety factor `scale` in `[0, 1]` from Binance's own isolated-margin liquidation
+  formula, projecting where the liquidation price would land if every remaining accumulate-side rung
+  filled at its planned size, and shrinks only that side (never the trim side, which already reduces
+  risk) accordingly. That projection answers "would this accumulation, once filled, be safe" — which can
+  read "safe" for a position that is *already* unsafe right now, because the projected fills improve the
+  average entry over time. `_liquidation_breached` exists for exactly that gap: whenever Binance's own
+  reported `liquidationPrice` (`Snapshot.liquidation_price`) has already crossed `survival_price`, it
+  forces `scale = 0.0` regardless of what the projection would otherwise say — ground truth about where
+  the position stands now beats a projection about where it would end up. The same predicate also drives
+  a third, independent guard: the backstop near the end of the in-zone tick body in `run()`, which runs on
+  *every* in-zone tick no matter which branch above it took (placement, settling, or an ordinary resting
+  ladder) and, the instant the reported price crosses, pulls the accumulate side off the book outright
+  with a per-id `execution.cancel_orders` (never the whole-symbol sweep `_cancel_ladder` uses) rather than
+  waiting for the next placement or reconcile to notice. See the design doc's "Liquidation-aware buy-side
+  cap" for the formula; do not remove `_liquidation_breached` or trust the projection alone, since a
+  position that already reads breached is precisely the case it was added to catch.
+- **A fill that first becomes visible on the same poll as an exit is not journalled — a known,
+  deliberately deferred gap** (`bot._log_ladder_fills`'s docstring). Every exit — `STOP_OUT`,
+  `HALT_FLATTEN`, the dead-band `SCALE_OUT`, a zone change, a symbol change — tears the ladder down
+  through `_cancel_ladder`, one bulk `execution.cancel_all_orders` call with no per-id status query
+  first, because the flatten behind it must not wait on a round-trip per rung. If a rung filled since the
+  last poll on the very tick that also decides an exit, the fill is never detected — the exit branch runs
+  first and the tick never reaches `_detect_fill`/`_reconcile_ladder` — and `_cancel_ladder` simply
+  discards the tracked id, so nothing ever asks the exchange what became of it. This is intentional, not
+  an oversight to quietly patch: closing it would mean snapshotting the tracked ids before every teardown
+  and querying them after the flatten has gone out, across every exit call site, and no exit call site
+  may grow a pre-order round-trip to do it. Do not add a "quick" fix that queries fills before an exit —
+  that reintroduces the exact latency the exit path exists to avoid.
 - **`settings.json` is re-read every tick** (`bot.py`'s loop calls `settings.load()` each iteration).
   This lets trend, leverage, and the zone ladder change without restarting the bot. An invalid edit
   (caught as `ValueError`/`KeyError`/`OSError`) is logged to the tick journal as a `config_error` and
@@ -195,7 +272,7 @@ collection.
   ahead of Binance's server clock, and Binance rejects a signed request whose timestamp is in the
   future with error -1021; the offset is measured once at startup against a public endpoint and applied
   to every subsequent timestamp.
-- `bot.py` holds the loop's mutable state — `active_index`, `halted`, `refused_cfg`, and the
-  `tick_log`/`config_log`/`error_log` `TickLog` instances; `market.py`, `strategy.py`, `execution.py`,
-  `journal.py`, and `notify.py` are stateless and take all inputs as arguments — don't reintroduce
-  module-level mutable state into them.
+- `bot.py` holds the loop's mutable state — `active_index`, `halted`, `refused_cfg`, `ladder_state`, and
+  the `tick_log`/`config_log`/`error_log` `TickLog` instances; `market.py`, `strategy.py`,
+  `execution.py`, `ladder.py`, `journal.py`, and `notify.py` are stateless and take all inputs as
+  arguments — don't reintroduce module-level mutable state into them.
