@@ -1121,6 +1121,85 @@ def test_a_failed_fill_lookup_does_not_stop_the_ladder_settling(monkeypatch, wri
     assert api.orders == len(all_ids) + 1
 
 
+def test_every_rung_of_a_cascade_is_journalled_not_just_the_first(monkeypatch, written):
+    """The fast case, where the most money moves, and the one the detect-tick
+    site alone cannot cover.
+
+    Once a fill arms the settling wait, the settling branch runs INSTEAD of
+    _detect_fill on every following tick - deliberately, because a filled id
+    stays absent forever and detection would otherwise re-arm the wait each tick
+    and never reconcile. The cost is that a SECOND rung filling during the wait
+    is seen by nothing: the settling branch only re-snapshots, and by the time
+    the reconcile pass prunes the id there is no record of it anywhere. That is
+    a trade that moved real money with no order-journal line, in exactly the
+    cascade a fast move through several rungs produces."""
+    order_journal = []
+    all_ids = resting_ladder_ids(monkeypatch)
+
+    api = LoopClient(
+        price="2500.00", balance="1000.0",
+        open_orders_after_tick={
+            2: [i for i in all_ids if i != all_ids[0]],       # first rung fills
+            3: [i for i in all_ids if i not in all_ids[:2]],  # second, mid-wait
+        },
+    )
+    # Tick 1 places. Tick 2 detects the first fill -> settling. Tick 3 finds the
+    # set changed again -> re-snapshot, still settling. Tick 4 finds it stable
+    # -> reconcile, which is where the second fill is finally accounted for.
+    records = run_loop(monkeypatch, written, ticks=4, api=api, orders=order_journal)
+
+    assert "error" not in actions(records)
+    journalled = sorted(r["order_id"] for r in order_journal)
+    assert journalled == sorted(all_ids[:2])  # BOTH, and each exactly once
+    assert all(r["reason"] in (strategy.SCALE_IN, strategy.SCALE_OUT) for r in order_journal)
+    # The rung price survives the prune: it is read off the map before the id is
+    # forgotten, which is the only place it exists.
+    assert all(r["rung_price"] is not None for r in order_journal)
+    # And the reconcile still did its own job - both gaps refilled.
+    assert api.orders == len(all_ids) + 2
+
+
+def test_a_fill_is_not_journalled_twice_when_the_reconcile_prunes_it(monkeypatch, written):
+    """Both sites see the same departed id: the tick that detected it, and the
+    reconcile that prunes it two ticks later. Exactly one record."""
+    order_journal = []
+    all_ids = resting_ladder_ids(monkeypatch)
+
+    api = LoopClient(
+        price="2500.00", balance="1000.0",
+        open_orders_after_tick={2: [i for i in all_ids if i != all_ids[0]]},
+    )
+    run_loop(monkeypatch, written, ticks=3, api=api, orders=order_journal)
+
+    assert [r["order_id"] for r in order_journal] == [all_ids[0]]
+
+
+def test_a_fill_taken_out_by_a_halt_is_still_journalled(monkeypatch, written):
+    """Why the detect-tick site is kept rather than folded into the reconcile.
+
+    Every exit - HALT, STOP_OUT, a dead-band SCALE_OUT, a zone change - tears
+    the ladder down through _cancel_ladder, which resets the state without ever
+    reconciling. A rung that fills on the tick before an adverse move is the
+    most likely fill there is (the move that fills it is the move that triggers
+    the exit), and journalling only at the prune point would lose it."""
+    order_journal = []
+    all_ids = resting_ladder_ids(monkeypatch)
+
+    api = LoopClient(
+        price="2500.00", balance="1000.0", position="0.2",
+        open_orders_after_tick={2: [i for i in all_ids if i != all_ids[0]]},
+        price_schedule={4: "1800.00"},  # price read 4 is loop tick 3
+    )
+    records = run_loop(monkeypatch, written, ticks=3, api=api, orders=order_journal)
+
+    assert any(r.get("action") == strategy.HALT for r in records)
+    assert api.cancelled == ["ETHUSDT"]  # the ladder was abandoned, not reconciled
+    # The flatten writes its own record through the market path; `rung_price` is
+    # what distinguishes a ladder fill from it.
+    ladder_fills = [r for r in order_journal if r.get("rung_price") is not None]
+    assert [r["order_id"] for r in ladder_fills] == [all_ids[0]]
+
+
 # --- the tick journal describes the live ladder ----------------------------
 
 

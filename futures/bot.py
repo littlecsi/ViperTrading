@@ -103,6 +103,16 @@ class LadderState:
         # record on it would write a line per poll for the whole of it - the
         # flood TickLog exists to prevent. See run()'s `acting`.
         self.blocked = False
+        # Order ids already written to the ORDER journal, still tracked in
+        # `orders`. A rung's fill is recorded from whichever of the two sites
+        # sees it first - the tick that detects it, or the reconcile pass that
+        # prunes it - and this is the one fact that keeps the second from
+        # writing the record again. Bounded and self-emptying: an id is added
+        # when it is journalled and discarded the moment it is pruned, so this
+        # holds only the fills between those two points, and a pruned id can
+        # never come back (the prune loop walks `orders`, which no longer has
+        # it). Cleared with the rest of the state on a zone change.
+        self.journalled: set[int] = set()
 
     def reset(self) -> None:
         self.__init__()
@@ -391,6 +401,74 @@ def _detect_fill(api, cfg, ladder_state) -> tuple:
     return tuple(tracked_ids - open_ids)
 
 
+def _journal_ladder_fill(api, cfg, decision, price, wallet, order_id, rung_price) -> bool:
+    """Journal and notify ONE rung that left the book, if it left by filling.
+
+    Shared by the two places a departed rung can first be seen: the tick that
+    detects it (`_log_ladder_fills`) and the reconcile pass that prunes it
+    (`_reconcile_ladder`). One function rather than two copies because the
+    guard is the interesting part and it must be identical in both - a
+    divergence here would mean the audit trail's contents depend on which site
+    happened to notice a rung first.
+
+    A tracked id that stopped being open is NOT necessarily a fill. The bot has
+    no fill event to read; it has a diff, and a rung the exchange or the
+    operator cancelled out from under it looks exactly the same. So the id is
+    queried and only a FILLED one is journalled - the alternative is an audit
+    trail carrying trades that never happened, at a fill price invented from the
+    rung's own limit.
+
+    Journal first and notify from what was written, as every other pushed event
+    does (_log_liquidation_brake, startup_refused, config_refused): a Telegram
+    problem must never cost the record, and the message can never disagree with
+    it. Unthrottled, like the market path's own fills - a fill is discrete and
+    moves real money.
+
+    A failed lookup is recorded as a tick `error` and stepped over rather than
+    allowed to raise: losing one record is bad, losing the settling wait or the
+    reconciliation that puts the missing rung back is worse.
+
+    Returns whether the exchange ANSWERED - not whether a record was written.
+    False means the order's state is still unknown and the other site should try
+    it again; a CANCELED answer is True, because that is terminal and re-asking
+    would spend a request to be told the same thing.
+
+    `decision.reason` is THIS tick's reason, not the one the rung was placed
+    under. Detection is up to one poll late and a rung can rest for hours, so
+    there is no honest way to recover the original; SCALE_IN/SCALE_OUT is the
+    only pair a ladder ever runs under, and which side the order was is on the
+    record already."""
+    try:
+        result = execution.query_order_result(api, cfg.symbol, order_id)
+    except Exception as exc:
+        journal.log_tick(
+            {"action": "error", "error": f"ladder fill lookup failed: {_ascii(exc)}"}
+        )
+        return False
+    if result.get("status") != "FILLED":
+        return True  # cancelled by us or the exchange, not a fill
+    fill = execution.fill_from_response(result)
+    record = {
+        "order_id": order_id,
+        "symbol": cfg.symbol,
+        "side": result.get("side"),
+        "reason": decision.reason,
+        "quantity": fill.qty,
+        "executed_qty": fill.qty,
+        "fill_price": fill.price,
+        "notional": fill.notional,
+        "rung_price": rung_price,
+        "mark_price": price,
+        "trend": cfg.trend,
+        "leverage": cfg.leverage,
+        "active_zone_index": decision.zone_index,
+        "balance": wallet,
+    }
+    journal.log_order(record)
+    notify.order_executed(record)
+    return True
+
+
 def _log_ladder_fills(api, cfg, decision, price, wallet, ladder_state, filled_ids) -> None:
     """Record every rung that filled, then push each record to Telegram.
 
@@ -404,29 +482,22 @@ def _log_ladder_fills(api, cfg, decision, price, wallet, ladder_state, filled_id
     at a cadence the throttle collapses, and says nothing about what price a
     rung actually filled at.
 
-    Journal first and notify from what was written, as every other pushed event
-    does (_log_liquidation_brake, startup_refused, config_refused): a Telegram
-    problem must never cost the record, and the message can never disagree with
-    it. Unthrottled, like the market path's own fills - a fill is discrete and
-    moves real money.
+    Each id goes through _journal_ladder_fill, which holds the is-it-really-a-
+    fill guard and the journal-then-notify order; this function is the
+    detect-tick half of the two sites that call it, and the only one that marks
+    what it resolved.
 
-    A tracked id that stopped being open is NOT necessarily a fill. The bot has
-    no fill event to read; it has a diff, and a rung the exchange or the
-    operator cancelled out from under it looks exactly the same. So each id is
-    queried and only a FILLED one is journalled - the alternative is an audit
-    trail carrying trades that never happened, at a fill price invented from the
-    rung's own limit.
+    Kept even though _reconcile_ladder journals its own pruned ids, because the
+    reconcile is not guaranteed to happen: every exit path (HALT, STOP_OUT, a
+    dead-band SCALE_OUT, a zone change, a symbol change) goes through
+    _cancel_ladder, which resets the state without reconciling. A rung that
+    fills on the tick before an adverse move - the exact move that triggers the
+    exit - would otherwise leave no record at all.
 
-    The lookup is one REST call per filled rung and it sits in front of the
-    settling wait, so a failure is recorded and stepped over rather than
-    allowed to raise: losing one record is bad, losing the reconciliation that
-    puts the missing rung back is worse.
-
-    `decision.reason` is THIS tick's reason, not the one the rung was placed
-    under. Detection is up to one poll late and a rung can rest for hours, so
-    there is no honest way to recover the original; SCALE_IN/SCALE_OUT is the
-    only pair this branch ever runs under, and which side the order was is on
-    the record already."""
+    The lookup is one REST call per departed rung and it sits in front of the
+    settling wait, which is why _journal_ladder_fill swallows its failures
+    rather than raising: losing one record is bad, losing the reconciliation
+    that puts the missing rung back is worse."""
     for order_id in filled_ids:
         # ladder_state.orders is keyed by the tick-rounded price actually sent,
         # so this is the rung the exchange was given - worth keeping next to
@@ -435,34 +506,14 @@ def _log_ladder_fills(api, cfg, decision, price, wallet, ladder_state, filled_id
             (p for p, oid in ladder_state.orders.items() if oid == order_id),
             None,
         )
-        try:
-            result = execution.query_order_result(api, cfg.symbol, order_id)
-        except Exception as exc:
-            journal.log_tick(
-                {"action": "error", "error": f"ladder fill lookup failed: {_ascii(exc)}"}
-            )
-            continue
-        if result.get("status") != "FILLED":
-            continue  # cancelled by us or the exchange, not a fill
-        fill = execution.fill_from_response(result)
-        record = {
-            "order_id": order_id,
-            "symbol": cfg.symbol,
-            "side": result.get("side"),
-            "reason": decision.reason,
-            "quantity": fill.qty,
-            "executed_qty": fill.qty,
-            "fill_price": fill.price,
-            "notional": fill.notional,
-            "rung_price": rung_price,
-            "mark_price": price,
-            "trend": cfg.trend,
-            "leverage": cfg.leverage,
-            "active_zone_index": decision.zone_index,
-            "balance": wallet,
-        }
-        journal.log_order(record)
-        notify.order_executed(record)
+        if _journal_ladder_fill(api, cfg, decision, price, wallet, order_id, rung_price):
+            # Marked only where the exchange actually ANSWERED, so an id whose
+            # lookup failed is left unmarked and gets a second attempt when the
+            # reconcile pass prunes it. Marked on a CANCELED answer too: that is
+            # settled - an order off the book is in a terminal state - and
+            # re-querying it would only spend a request to be told the same
+            # thing.
+            ladder_state.journalled.add(order_id)
 
 
 def _reconcile_ladder(
@@ -557,9 +608,37 @@ def _reconcile_ladder(
     # sustained liquidation breach every one of those passes refuses the
     # accumulate side afresh and engages the brake, so the transition-only
     # notification became one per two polls during the emergency.
+    #
+    # This is also the LAST and only complete account of what left the book,
+    # which is why the fills are recorded from here and not just from the tick
+    # that detected one. The detect branch never runs again once the wait is
+    # armed - a filled id stays absent, so detecting it again would re-arm the
+    # wait every tick and nothing would ever reconcile - so a rung that fills
+    # DURING the wait is seen by nobody else: the settling branch only
+    # re-snapshots, and this loop then forgets the id. That is the fast cascade,
+    # where the most money moves, and it was leaving trades with no order-journal
+    # line at all.
+    #
+    # Ahead of the cancel/place work below rather than after it, unlike the
+    # brake notification. That rule exists so nothing that talks to Telegram
+    # delays an order this call is deciding to send; these fills happened before
+    # this call started, and holding them until after the book work would mean
+    # a raise in the middle of it lost them permanently.
     live_ids = {o["orderId"] for o in open_orders}
     for rung_price, order_id in list(ladder_state.orders.items()):
         if order_id not in live_ids:
+            # Already recorded by the tick that detected it - written once, and
+            # the id leaves the dedupe set with the rung it belonged to.
+            if order_id in ladder_state.journalled:
+                ladder_state.journalled.discard(order_id)
+            else:
+                _journal_ladder_fill(
+                    api, cfg, decision, price, snapshot.wallet_balance,
+                    order_id, rung_price,
+                )
+            # Pruned either way, including after a failed lookup: the id is off
+            # the book and cannot come back, and keeping it would hand
+            # _detect_fill the same phantom fill on every tick from here on.
             del ladder_state.orders[rung_price]
 
     plan = ladder.plan_orders(valid, open_orders, filters)
