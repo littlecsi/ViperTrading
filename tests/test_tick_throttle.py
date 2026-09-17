@@ -660,7 +660,13 @@ def test_a_failing_cancel_never_gates_the_halt_flatten(monkeypatch, written):
     latched, and the bot sat on a leveraged position indefinitely with
     notify.halt never called even once. The cancel is best-effort: it is
     attempted first, its failure is journalled like any other loop error, and
-    the flatten goes out regardless."""
+    the flatten goes out regardless.
+
+    Journalled and NOTIFIED are not the same step here. The journal write is a
+    local append and happens immediately; the Telegram push is an HTTP call
+    worth up to notify.TIMEOUT_SECONDS, so it waits until the market order has
+    actually gone out - the same ordering the FLATTEN_FAILED notification
+    already follows. It still has to happen, just not first."""
     from binance.error import ClientError
 
     halts = []
@@ -671,12 +677,23 @@ def test_a_failing_cancel_never_gates_the_halt_flatten(monkeypatch, written):
         price_schedule={3: "1800.00"},
         cancel_error=lambda n: ClientError(429, -1003, "Too many requests", {}),
     )
+    # Recorded into the same timeline as the exchange calls, which is the only
+    # way to see WHERE the push happened relative to the market order.
+    monkeypatch.setattr(
+        bot.notify, "loop_error",
+        lambda message, symbol=None: api.events.append(("notify", message)),
+    )
     records = run_loop(monkeypatch, written, ticks=2, api=api)
 
     assert ("place", "MARKET") in api.events  # flattened on THIS tick
     assert halts == [bot.notify.FLATTENED]  # and said so
     errors = [r["error"] for r in records if r.get("action") == "error"]
     assert any("ladder cancel failed" in e for e in errors)  # not swallowed
+
+    pushed = [i for i, (kind, text) in enumerate(api.events)
+              if kind == "notify" and "ladder cancel failed" in text]
+    assert pushed  # and still pushed, not just written to disk
+    assert api.events.index(("place", "MARKET")) < pushed[0]  # after the exit
 
 
 def test_a_symbol_switch_cancels_the_old_symbols_ladder(monkeypatch, written):

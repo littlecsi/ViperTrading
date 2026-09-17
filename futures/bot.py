@@ -247,6 +247,21 @@ def _cancel_ladder(api, cfg, ladder_state) -> None:
     ladder_state.reset()
 
 
+def _notify_cancel_failure(message, symbol) -> None:
+    """Push a failed exit-path ladder cancel - AFTER the flatten, never before.
+
+    The failure is journalled the moment it happens; this is only the Telegram
+    half, held back because it is an HTTP call worth up to
+    notify.TIMEOUT_SECONDS and the market order behind it is the response to an
+    adverse move. It is the same rule the HALT notification follows, applied to
+    a smaller call: nothing that talks to the network gets in front of the
+    flatten. `message` is None on every tick where there was nothing to say,
+    which is nearly all of them."""
+    if not message:
+        return
+    notify.loop_error(message, symbol=symbol)
+
+
 def _sleep(seconds) -> None:
     """Sleep the poll interval, clamped, and unable to raise.
 
@@ -612,21 +627,33 @@ def run() -> None:
             # remaining position is too small to close still has to cancel, or
             # price leaves the ladder with the bot's accumulate rungs resting
             # under it and nothing watching what they fill.
+            cancel_failure = None
             if not in_zone_ladder_case:
                 try:
                     _cancel_ladder(api, cfg, ladder_state)
                 except Exception as exc:
                     # Recorded exactly like a loop error - same stream, same
                     # throttle, same notification - because that is what it is.
-                    # Guarded in turn so that nothing in the reporting (a locked
+                    # The two halves of "recorded" are split, though, and the
+                    # split is the whole point: the journal write is a local
+                    # append and happens HERE, while the Telegram push is an
+                    # HTTP call worth up to notify.TIMEOUT_SECONDS and is
+                    # deferred to _notify_cancel_failure below, once the
+                    # flatten has actually gone out. Reporting that the cancel
+                    # failed must not itself delay the market order - that is
+                    # the same mistake, one network call smaller.
+                    #
+                    # Guarded so that nothing in the reporting (a locked
                     # journal file, an unencodable message) can do what this
                     # whole block exists to prevent and stop the flatten.
+                    # cancel_failure is set only when the record was WRITTEN,
+                    # reusing the throttle above rather than adding a second.
                     try:
                         message = f"ladder cancel failed: {_ascii(exc)}"
                         if error_log.log(
                             {"action": "error", "error": message}, key=("error", message)
                         ):
-                            notify.loop_error(message, symbol=cfg.symbol)
+                            cancel_failure = message
                     except Exception:
                         pass
 
@@ -701,6 +728,9 @@ def run() -> None:
                     # what is left of it is below the exchange minimum and this
                     # bot cannot close it at all.
                     notify.halt(outcome=notify.NOT_FLATTENED, **halt_context)
+                # Nothing was going to be sent on this path, so there is no
+                # order left to delay; the deferred push happens here instead.
+                _notify_cancel_failure(cancel_failure, cfg.symbol)
                 active_index = decision.zone_index
                 _sleep(cfg.poll_seconds)
                 continue
@@ -733,6 +763,14 @@ def run() -> None:
                         **halt_context,
                     )
                 raise
+            finally:
+                # After the market order, whichever way it went. A finally
+                # rather than one line on each branch because the raise path
+                # needs it too: it re-raises into the loop handler, which
+                # reports the ORDER failure and would never mention the cancel
+                # that failed just before it. Ordered behind the
+                # FLATTEN_FAILED push above, which is the more urgent alarm.
+                _notify_cancel_failure(cancel_failure, cfg.symbol)
 
             # The order is live on the exchange from here. Everything below is
             # bookkeeping, and a failure in it must not lose the fill record or
