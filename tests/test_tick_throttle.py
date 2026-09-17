@@ -250,6 +250,11 @@ class LoopClient:
         self._open_orders = []
         self.cancelled = []  # one symbol per cancel_open_orders call
         self.cancelled_order_ids = []  # one id per cancel_order call
+        # Every id this client took off the book itself, by either route. An
+        # id that merely stopped being open is a FILL; one that is in here was
+        # CANCELLED, and query_order has to be able to tell the two apart -
+        # that distinction is the whole reason the fill journal queries at all.
+        self._cancelled_ids = set()
         self.events = []  # ("place", type) / ("cancel", symbol), in call order
         self.margin_type_calls = []
 
@@ -317,6 +322,7 @@ class LoopClient:
         visible now that the method exists at all."""
         self.cancelled_order_ids.append(orderId)
         self.events.append(("cancel_one", orderId))
+        self._cancelled_ids.add(orderId)
         self._open_orders = [o for o in self._open_orders if o["orderId"] != orderId]
         return {"orderId": orderId, "status": "CANCELED"}
 
@@ -329,6 +335,7 @@ class LoopClient:
                 # A cancel that failed took nothing off the book, so the rungs
                 # stay open - which is what makes the retry path testable.
                 raise error
+        self._cancelled_ids.update(o["orderId"] for o in self._open_orders)
         self._open_orders = []
         return {"code": 200, "msg": "The operation of cancel all open order is done."}
 
@@ -352,6 +359,38 @@ class LoopClient:
             return {"orderId": self.orders, "status": "NEW"}
         return {"orderId": self.orders, "avgPrice": "0", "executedQty": "0", "cumQuote": "0"}
 
+    def query_order(self, symbol, orderId):
+        """One order as the exchange reports it, which is how a FILLED rung is
+        told from a CANCELLED one.
+
+        The bot only ever sees that a tracked id stopped being open; that is
+        true of a fill and of a cancellation alike, and only one of them is an
+        executed order. Ids this client cancelled itself come back CANCELED,
+        ids still resting come back NEW, and anything else gone from the book
+        is a fill reported at its own limit price."""
+        params = self.placed_orders[orderId - 1] if 0 < orderId <= len(self.placed_orders) else {}
+        if orderId in self._cancelled_ids:
+            status = "CANCELED"
+        elif any(o["orderId"] == orderId for o in self._open_orders):
+            status = "NEW"
+        else:
+            status = "FILLED"
+        qty = float(params.get("quantity") or 0.0)
+        price = float(params.get("price") or 0.0)
+        filled = status == "FILLED"
+        return {
+            "orderId": orderId,
+            "symbol": symbol,
+            "side": params.get("side"),
+            "type": params.get("type"),
+            "status": status,
+            "price": str(price),
+            "origQty": str(qty),
+            "avgPrice": str(price) if filled else "0",
+            "executedQty": str(qty) if filled else "0",
+            "cumQuote": str(qty * price) if filled else "0",
+        }
+
     def change_margin_type(self, symbol, marginType):
         self.margin_type_calls.append((symbol, marginType))
         if self.margin_type_error is not None:
@@ -364,15 +403,24 @@ class LoopClient:
         ]}]
 
 
-def run_loop(monkeypatch, written, ticks, api=None, load=None):
-    """Run bot.run() for `ticks` polls on a fake clock, returning the records."""
+def run_loop(monkeypatch, written, ticks, api=None, load=None, orders=None):
+    """Run bot.run() for `ticks` polls on a fake clock, returning the records.
+
+    `orders` collects what reached journal.log_order. It is a parameter rather
+    than something a test patches for itself because this patch has to happen
+    LAST - it is also what keeps the suite from appending to the operator's real
+    order journal - and a test's own monkeypatch of the same name would be
+    silently overwritten here."""
     api = api or LoopClient()
     clock = Clock()
     real_ticklog = bot.TickLog
+    order_records = [] if orders is None else orders
 
     monkeypatch.setattr(bot.client, "build", lambda testnet: api)
     monkeypatch.setattr(bot, "TickLog", lambda *a, **kw: real_ticklog(clock=clock))
-    monkeypatch.setattr(journal, "log_order", lambda record, log_dir=None: None)
+    monkeypatch.setattr(
+        journal, "log_order", lambda record, log_dir=None: order_records.append(record)
+    )
 
     if load is not None:
         real_load = bot.settings.load
@@ -925,6 +973,195 @@ def test_settling_waits_while_the_open_order_set_is_still_changing(monkeypatch, 
     assert api.orders == len(all_ids)
     assert api.cancelled == []
     assert api.cancelled_order_ids == []
+
+
+# --- a filled rung reaches the order journal -------------------------------
+#
+# A ladder PLACEMENT is not a trade and deliberately never reaches
+# journal.log_order. A ladder FILL is: it moved real money, it is what the
+# position is made of, and without a record of it the order journal - the audit
+# trail, and the dataset a PPO policy trains on - simply has no entries for the
+# execution path the bot now does nearly all of its trading through.
+
+
+def test_a_filled_rung_writes_an_order_journal_record(monkeypatch, written):
+    order_journal = []
+
+    control = LoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, written, ticks=1, api=control)
+    all_ids = [o["orderId"] for o in control._open_orders]
+    fill_one = all_ids[0]
+
+    api = LoopClient(
+        price="2500.00", balance="1000.0",
+        open_orders_after_tick={2: [i for i in all_ids if i != fill_one]},
+    )
+    records = run_loop(monkeypatch, written, ticks=3, api=api, orders=order_journal)
+
+    assert "error" not in actions(records)
+    assert any(r.get("order_id") == fill_one for r in order_journal)
+    filled_record = next(r for r in order_journal if r.get("order_id") == fill_one)
+    assert filled_record["reason"] in (strategy.SCALE_IN, strategy.SCALE_OUT)
+    # The fill is recorded as the EXCHANGE reported it, not as it was planned:
+    # side, quantity and price come back off the queried order.
+    assert filled_record["symbol"] == "ETHUSDT"
+    assert filled_record["side"] == control.placed_orders[fill_one - 1]["side"]
+    assert filled_record["fill_price"] == pytest.approx(
+        control.placed_orders[fill_one - 1]["price"]
+    )
+    assert filled_record["executed_qty"] == pytest.approx(
+        control.placed_orders[fill_one - 1]["quantity"]
+    )
+    assert filled_record["rung_price"] == pytest.approx(
+        control.placed_orders[fill_one - 1]["price"]
+    )
+
+
+def test_a_ladder_fill_is_notified_from_the_record_that_was_journalled(monkeypatch, written):
+    """Journal first, push second, and from the SAME dict - the rule every
+    other notified event in bot.py follows. A Telegram problem must never cost
+    an order-journal line, and the message can never disagree with the audit
+    trail."""
+    order_journal = []
+    pushed = []
+    monkeypatch.setattr(bot.notify, "order_executed", lambda record: pushed.append(record))
+
+    control = LoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, written, ticks=1, api=control)
+    all_ids = [o["orderId"] for o in control._open_orders]
+
+    api = LoopClient(
+        price="2500.00", balance="1000.0",
+        open_orders_after_tick={2: [i for i in all_ids if i != all_ids[0]]},
+    )
+    run_loop(monkeypatch, written, ticks=3, api=api, orders=order_journal)
+
+    assert len(pushed) == 1
+    assert pushed[0] is order_journal[0]  # the same object, not a second one
+
+
+def test_a_ladder_fill_is_journalled_before_settling_begins(monkeypatch, written):
+    """Recording the fill must not change what the tick DOES about it. The tick
+    that sees a fill still only starts the settling wait: nothing is cancelled
+    and nothing is replaced until the open-order set stops moving."""
+    order_journal = []
+    control = LoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, written, ticks=1, api=control)
+    all_ids = [o["orderId"] for o in control._open_orders]
+
+    api = LoopClient(
+        price="2500.00", balance="1000.0",
+        open_orders_after_tick={2: [i for i in all_ids if i != all_ids[0]]},
+    )
+    run_loop(monkeypatch, written, ticks=2, api=api, orders=order_journal)
+
+    assert len(order_journal) == 1  # the fill was recorded
+    assert api.cancelled == []  # but the book was left alone
+    assert api.cancelled_order_ids == []
+    assert api.orders == control.orders
+
+
+class CancelledRungLoopClient(LoopClient):
+    """Every tracked rung that left the book did so by CANCELLATION.
+
+    The bot cannot see a fill directly - it sees an id that stopped being
+    reported as open, which is equally true of an order the exchange or the
+    operator cancelled out from under it. Journalling that as an executed order
+    would put a trade in the audit trail that never happened, with a fill price
+    and a notional invented from the rung's own limit price."""
+
+    def query_order(self, symbol, orderId):
+        return {**super().query_order(symbol, orderId),
+                "status": "CANCELED", "avgPrice": "0", "executedQty": "0", "cumQuote": "0"}
+
+
+def test_a_cancelled_rung_is_not_journalled_as_a_fill(monkeypatch, written):
+    order_journal = []
+    control = CancelledRungLoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, written, ticks=1, api=control)
+    all_ids = [o["orderId"] for o in control._open_orders]
+
+    api = CancelledRungLoopClient(
+        price="2500.00", balance="1000.0",
+        open_orders_after_tick={2: [i for i in all_ids if i != all_ids[0]]},
+    )
+    records = run_loop(monkeypatch, written, ticks=3, api=api, orders=order_journal)
+
+    assert order_journal == []
+    # It still needs reconciling, though - the rung is off the book either way.
+    assert "error" not in actions(records)
+    assert api.orders == len(all_ids) + 1
+
+
+class UnqueryableLoopClient(LoopClient):
+    """The fill lookup fails. One extra REST call per detected fill is one more
+    thing that can raise, and it sits directly in front of the settling wait."""
+
+    def query_order(self, symbol, orderId):
+        raise RuntimeError("-1021 Timestamp for this request is outside of the recvWindow")
+
+
+def test_a_failed_fill_lookup_does_not_stop_the_ladder_settling(monkeypatch, written):
+    order_journal = []
+    control = LoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, written, ticks=1, api=control)
+    all_ids = [o["orderId"] for o in control._open_orders]
+
+    api = UnqueryableLoopClient(
+        price="2500.00", balance="1000.0",
+        open_orders_after_tick={2: [i for i in all_ids if i != all_ids[0]]},
+    )
+    records = run_loop(monkeypatch, written, ticks=3, api=api, orders=order_journal)
+
+    assert order_journal == []
+    errors = [r["error"] for r in records if r.get("action") == "error"]
+    assert any("ladder fill lookup failed" in e for e in errors)  # said so
+    # And the ladder still settled and reconciled: losing the record must not
+    # cost the rebuild that puts the missing rung back.
+    assert api.orders == len(all_ids) + 1
+
+
+# --- the tick journal describes the live ladder ----------------------------
+
+
+def test_a_live_ladder_reports_its_rung_count(monkeypatch, written):
+    """How many rungs are resting is not derivable from anything else in the
+    record - the tick journal otherwise describes the position and says nothing
+    about the orders working it."""
+    api = LoopClient(price="2500.00", balance="1000.0")
+    records = run_loop(monkeypatch, written, ticks=120, api=api)
+
+    ladder_ticks = [r for r in records if r.get("reason") == strategy.SCALE_IN]
+    assert len(ladder_ticks) == 2  # 120s at a 1s poll
+    # The first record is the activation tick, written before the rungs went
+    # out; the second describes the ladder that has been resting since.
+    assert ladder_ticks[0]["ladder_rungs_total"] == 0
+    assert ladder_ticks[1]["ladder_rungs_total"] == len(api._open_orders) > 1
+
+
+def test_the_tick_journal_carries_the_reported_liquidation_price(monkeypatch, written):
+    """The one number that says how close the account is to being closed out by
+    the exchange. The backstop already acts on it; the journal has to be able to
+    show how it got there, and after the fact it is unrecoverable."""
+    api = LoopClient(
+        price="2500.00", balance="1000.0",
+        position="0.2", entry_price="2500.00", isolated_wallet="500.00",
+        liquidation_price="2000.00",
+    )
+    records = run_loop(monkeypatch, written, ticks=1, api=api)
+
+    assert "error" not in actions(records)
+    assert records[-1]["liquidation_price"] == 2000.0
+
+
+def test_a_tick_with_no_ladder_reports_no_rung_count(monkeypatch, written):
+    """Off the ladder entirely (HALT below every support): 0 rungs and "this
+    tick was not about a ladder" are different facts, so the field is None
+    rather than a count that reads as an empty ladder."""
+    api = LoopClient(price="1800.00", balance="1000.0")
+    records = run_loop(monkeypatch, written, ticks=1, api=api)
+
+    assert records[-1]["ladder_rungs_total"] is None
 
 
 # --- the reported-liquidation-price backstop -------------------------------

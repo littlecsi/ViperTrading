@@ -391,6 +391,80 @@ def _detect_fill(api, cfg, ladder_state) -> tuple:
     return tuple(tracked_ids - open_ids)
 
 
+def _log_ladder_fills(api, cfg, decision, price, wallet, ladder_state, filled_ids) -> None:
+    """Record every rung that filled, then push each record to Telegram.
+
+    A ladder PLACEMENT is not a trade and deliberately reaches no order
+    journal; a ladder FILL is the trade. Once in-zone accumulation moved off
+    market orders and onto resting rungs, every entry and every trim the bot
+    makes inside a zone happens here - so without this the order journal, which
+    is both the audit trail and the dataset a learned policy trains on, has no
+    entries at all for the path the bot now does nearly all of its trading
+    through. The tick journal cannot stand in for it: it records the DECISION,
+    at a cadence the throttle collapses, and says nothing about what price a
+    rung actually filled at.
+
+    Journal first and notify from what was written, as every other pushed event
+    does (_log_liquidation_brake, startup_refused, config_refused): a Telegram
+    problem must never cost the record, and the message can never disagree with
+    it. Unthrottled, like the market path's own fills - a fill is discrete and
+    moves real money.
+
+    A tracked id that stopped being open is NOT necessarily a fill. The bot has
+    no fill event to read; it has a diff, and a rung the exchange or the
+    operator cancelled out from under it looks exactly the same. So each id is
+    queried and only a FILLED one is journalled - the alternative is an audit
+    trail carrying trades that never happened, at a fill price invented from the
+    rung's own limit.
+
+    The lookup is one REST call per filled rung and it sits in front of the
+    settling wait, so a failure is recorded and stepped over rather than
+    allowed to raise: losing one record is bad, losing the reconciliation that
+    puts the missing rung back is worse.
+
+    `decision.reason` is THIS tick's reason, not the one the rung was placed
+    under. Detection is up to one poll late and a rung can rest for hours, so
+    there is no honest way to recover the original; SCALE_IN/SCALE_OUT is the
+    only pair this branch ever runs under, and which side the order was is on
+    the record already."""
+    for order_id in filled_ids:
+        # ladder_state.orders is keyed by the tick-rounded price actually sent,
+        # so this is the rung the exchange was given - worth keeping next to
+        # the realised fill price, which is what a maker order actually got.
+        rung_price = next(
+            (p for p, oid in ladder_state.orders.items() if oid == order_id),
+            None,
+        )
+        try:
+            result = execution.query_order_result(api, cfg.symbol, order_id)
+        except Exception as exc:
+            journal.log_tick(
+                {"action": "error", "error": f"ladder fill lookup failed: {_ascii(exc)}"}
+            )
+            continue
+        if result.get("status") != "FILLED":
+            continue  # cancelled by us or the exchange, not a fill
+        fill = execution.fill_from_response(result)
+        record = {
+            "order_id": order_id,
+            "symbol": cfg.symbol,
+            "side": result.get("side"),
+            "reason": decision.reason,
+            "quantity": fill.qty,
+            "executed_qty": fill.qty,
+            "fill_price": fill.price,
+            "notional": fill.notional,
+            "rung_price": rung_price,
+            "mark_price": price,
+            "trend": cfg.trend,
+            "leverage": cfg.leverage,
+            "active_zone_index": decision.zone_index,
+            "balance": wallet,
+        }
+        journal.log_order(record)
+        notify.order_executed(record)
+
+
 def _reconcile_ladder(
     api, cfg, decision, price, snapshot, filters, leverage_brackets, ladder_state
 ) -> None:
@@ -872,6 +946,19 @@ def run() -> None:
                 "reason": decision.reason,
                 "balance": wallet,
                 "unrealized_pnl": pnl,
+                # How many rungs were resting as this tick began. Nothing else
+                # in the record says anything about the orders working the
+                # position, and the throttle means the next record can be a
+                # minute away. None rather than 0 off the ladder case: "no
+                # ladder here" and "a ladder with no rungs left" are different
+                # facts, and the second is a real state (the backstop cancels
+                # an all-accumulate ladder down to nothing).
+                "ladder_rungs_total": len(ladder_state.orders) if in_zone_ladder_case else None,
+                # The exchange's own figure for where this position gets closed
+                # out. The backstop already acts on it, so the journal has to be
+                # able to show what it was acting on; it is unrecoverable after
+                # the fact.
+                "liquidation_price": snapshot.liquidation_price,
             }
             tick_key = (decision.action, decision.reason)
             wrote_tick = tick_log.log(tick_record, key=tick_key, forced=acting)
@@ -1015,7 +1102,18 @@ def run() -> None:
                             )
                         else:
                             ladder_state.settling_snapshot = open_now
-                    elif _detect_fill(api, cfg, ladder_state):
+                    elif (filled_ids := _detect_fill(api, cfg, ladder_state)):
+                        # Recorded before anything else happens, and while the
+                        # rung->id map still holds the ids: _reconcile_ladder
+                        # prunes a filled id on the tick the wait ends, so by
+                        # then there is nothing left to look the rung price up
+                        # from. The journal write is local and the notification
+                        # cannot raise, and neither gets in front of an order -
+                        # this branch deliberately sends none.
+                        _log_ladder_fills(
+                            api, cfg, decision, price, wallet, ladder_state,
+                            filled_ids,
+                        )
                         # A rung filled, so the ladder no longer matches the
                         # position - but this tick does NOTHING about it beyond
                         # starting the wait. A fill that moved price through one
