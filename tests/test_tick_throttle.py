@@ -261,7 +261,11 @@ class LoopClient:
         self.orders += 1
         self.placed_orders.append(params)
         if self.order_error is not None:
-            raise RuntimeError(self.order_error(self.orders))
+            # A falsy return means "accept this one", so a test can reject only
+            # some calls - a ladder whose margin runs out partway through.
+            message = self.order_error(self.orders)
+            if message:
+                raise RuntimeError(message)
         if params.get("type") == "LIMIT":
             return {"orderId": self.orders, "status": "NEW"}
         return {"orderId": self.orders, "avgPrice": "0", "executedQty": "0", "cumQuote": "0"}
@@ -419,3 +423,58 @@ def test_zone_activation_places_a_full_ladder_of_limit_orders(monkeypatch, writt
     run_loop(monkeypatch, written, ticks=1, api=api)
     assert api.orders > 0
     assert all(o["type"] == "LIMIT" for o in api.placed_orders)
+
+
+def test_a_resting_ladder_is_placed_once_not_re_placed_every_tick(monkeypatch, written):
+    """Price sits still inside the zone: the ladder goes on the book once and
+    is then left alone, however long price stays there."""
+    api = LoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, written, ticks=300, api=api)
+
+    after_one_tick = LoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, [], ticks=1, api=after_one_tick)
+    assert api.orders == after_one_tick.orders > 0  # 300 polls, one placement
+
+
+def test_a_resting_ladder_does_not_flood_the_tick_journal(monkeypatch, written):
+    """The position stays flat while the rungs rest, so `delta` - and with it
+    the old forced=sending - stays large on every poll. Forcing on that wrote a
+    line per poll for as long as price sat in the zone, which is the flood
+    TickLog exists to prevent. A resting ladder is a sustained state and
+    throttles like one; the tick that PLACED it is a transition and is kept."""
+    api = LoopClient(price="2500.00", balance="1000.0")
+    records = run_loop(monkeypatch, written, ticks=300, api=api)
+
+    ladder_ticks = [r for r in records if r.get("reason") == strategy.SCALE_IN]
+    assert len(ladder_ticks) == 5  # 300s at a 1s poll, not 300 records
+
+
+def test_a_partly_rejected_ladder_is_not_re_placed_every_tick(monkeypatch, written):
+    """The rungs accepted before a rejection are LIVE on the exchange. If
+    active_index did not advance past a placement that raised, the next tick
+    would read the zone as still changed, forget those live orders and place
+    the whole set again - once per poll, unbounded. Rejection partway through is
+    ordinary: at exposure_fraction 1.0 the margin runs out mid-ladder (-2019)."""
+    api = LoopClient(
+        price="2500.00", balance="1000.0",
+        # Accept four rungs, then reject, exactly as a margin wall would.
+        order_error=lambda n: "-2019 Margin is insufficient" if n % 5 == 0 else None,
+    )
+    run_loop(monkeypatch, written, ticks=10, api=api)
+
+    assert api.orders == 5  # four placed and the one rejected, then it stops
+    # The four live rungs are still tracked, so no tick re-places them.
+    assert len(api.placed_orders) == 5
+
+
+def test_a_fully_rejected_ladder_still_retries_next_tick(monkeypatch, written):
+    """The other half of the partial-failure rule: when NOTHING was accepted
+    there is nothing resting to duplicate, so the tracked set stays empty and
+    the next tick must retry from scratch rather than give up on the zone."""
+    api = LoopClient(
+        price="2500.00", balance="1000.0",
+        order_error=lambda n: "-2019 Margin is insufficient",
+    )
+    run_loop(monkeypatch, written, ticks=10, api=api)
+
+    assert api.orders == 10  # one attempt per tick, still trying

@@ -439,6 +439,42 @@ def run() -> None:
                 qty = execution.quantity_for(decision.delta, price, filters)
                 sending = execution.is_executable(qty, price, filters)
 
+            # In-zone accumulation and trimming rest on the book as a ladder of
+            # limit orders instead of crossing the spread with a market order
+            # every tick. Only this case is routed away: STOP_OUT, HALT_FLATTEN
+            # and the dead-band SCALE_OUT (zone_index is None) are exits, where
+            # certainty of execution beats price, and they keep using execute()
+            # further down exactly as before.
+            in_zone_ladder_case = (
+                decision.zone_index is not None
+                and decision.reason in (strategy.SCALE_IN, strategy.SCALE_OUT)
+            )
+            # Placed on zone ACTIVATION only. A changed zone means the old
+            # zone's ladder is gone (the STOP_OUT that carried price here
+            # flattened the position), so its tracked rungs are discarded and a
+            # fresh set placed; an empty tracked set with the zone unchanged is
+            # the first entry into it. An already-placed ladder is left resting
+            # - re-placing it every tick would re-send the same rungs for as
+            # long as price sat in the zone. Decided HERE, above the journal
+            # write, because whether the tick acts is what the write policy
+            # keys on; nothing between here and the branch itself mutates
+            # active_index or ladder_state, so the answer cannot go stale.
+            placing_ladder = in_zone_ladder_case and (
+                decision.zone_index != active_index or not ladder_state.orders
+            )
+
+            # `forced` means THIS TICK ACTS - not "an order would be
+            # executable". The two part company once a ladder is resting: the
+            # position is still flat, so `sending` stays true on every poll
+            # while the tick does nothing but watch rungs already on the book.
+            # Forcing on that would write a line per poll for as long as price
+            # sat in the zone, which is the ~86400-lines-a-day flood TickLog
+            # exists to prevent - and in exactly the walked-away-operator case
+            # it was built for. A resting ladder is a sustained state like any
+            # other and throttles to one line a minute; the tick that actually
+            # places the ladder is a transition, and is always written.
+            acting = placing_ladder if in_zone_ladder_case else sending
+
             tick_log.log(
                 {
                     "symbol": cfg.symbol,
@@ -459,7 +495,7 @@ def run() -> None:
                     "unrealized_pnl": pnl,
                 },
                 key=(decision.action, decision.reason),
-                forced=sending,
+                forced=acting,
             )
 
             if decision.action in (strategy.HOLD, strategy.IDLE):
@@ -488,33 +524,33 @@ def run() -> None:
                     "position_notional": position_notional,
                 }
 
-            # In-zone accumulation and trimming rest on the book as a ladder of
-            # limit orders instead of crossing the spread with a market order
-            # every tick. Only this case is routed away: STOP_OUT, HALT_FLATTEN
-            # and the dead-band SCALE_OUT (zone_index is None) are exits, where
-            # certainty of execution beats price, and they keep using execute()
-            # below exactly as before.
-            in_zone_ladder_case = (
-                decision.zone_index is not None
-                and decision.reason in (strategy.SCALE_IN, strategy.SCALE_OUT)
-            )
-
             if in_zone_ladder_case:
-                # Placed on zone ACTIVATION only. A changed zone means the old
-                # zone's ladder is gone (the STOP_OUT that carried price here
-                # flattened the position), so its tracked rungs are discarded
-                # and a fresh set placed; an empty set with the zone unchanged
-                # is the first entry into it. An already-placed ladder is left
-                # resting - re-placing it every tick would cancel and re-send
-                # the same rungs for as long as price sat in the zone.
-                zone_changed = decision.zone_index != active_index
-                if zone_changed or not ladder_state.orders:
-                    ladder_state.reset()
-                    _place_ladder(
-                        api, cfg, decision.zone_index, price, decision.max_n,
-                        filters, leverage_brackets, ladder_state,
-                    )
-                active_index = decision.zone_index
+                try:
+                    if placing_ladder:
+                        ladder_state.reset()
+                        _place_ladder(
+                            api, cfg, decision.zone_index, price, decision.max_n,
+                            filters, leverage_brackets, ladder_state,
+                        )
+                finally:
+                    # active_index advances even if placement raised partway
+                    # through, mirroring the market path's own finally below.
+                    # Without it a half-placed ladder is not merely incomplete,
+                    # it is catastrophic: the rungs already accepted are LIVE on
+                    # the exchange, but the next tick would still read the zone
+                    # as changed, reset the tracked ids - forgetting those live
+                    # orders rather than cancelling them - and place the whole
+                    # set again, once per poll, unbounded. Rejection partway is
+                    # the ordinary case, not an exotic one: at exposure_fraction
+                    # 1.0 the margin runs out mid-ladder and Binance answers
+                    # -2019. Advancing here makes the retry condition false
+                    # instead, so a partial ladder is simply left resting as it
+                    # is; the rungs that did place are still tracked, and the
+                    # gap is what the reconciliation pass is for. When NOTHING
+                    # placed, the tracked set is still empty, so the next tick
+                    # correctly retries from scratch - safe, because there is
+                    # nothing resting yet to duplicate.
+                    active_index = decision.zone_index
                 _sleep(cfg.poll_seconds)
                 continue
 
