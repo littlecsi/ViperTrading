@@ -5,7 +5,24 @@ import execution
 import strategy
 from market import Filters
 
-F = Filters(step_size=0.001, min_qty=0.001, min_notional=20.0)
+F = Filters(step_size=0.001, min_qty=0.001, min_notional=20.0, tick_size=0.01)
+
+
+def test_price_for_rounds_down_to_the_nearest_tick():
+    # 2400.017 / 0.01 = 240001.7 -> floor 240001 -> 2400.01
+    assert execution.price_for(2400.017, F) == 2400.01
+
+
+def test_price_for_exact_multiple_is_unchanged():
+    assert execution.price_for(2400.05, F) == 2400.05
+
+
+def test_price_for_handles_floating_point_noise():
+    # 0.1 + 0.2 style noise must not round to an invalid tick.
+    price = 2400.00 + 0.01 * 3  # binary float noise around 2400.03
+    result = execution.price_for(price, F)
+    assert round(result / F.tick_size) == round(result / F.tick_size)  # exact multiple
+    assert result == 2400.03
 
 
 def test_quantity_floors_to_step_size():

@@ -10,7 +10,7 @@ from strategy import distance, target_notional, signed
 
 ZONE = Zone(support=2371.26, resistance=2625.00)
 TIER = MarginTier(floor=0.0, cap=250000.0, maint_margin_rate=0.05, maint_amount=10.0)
-FILTERS = Filters(step_size=0.001, min_qty=0.001, min_notional=20.0)
+FILTERS = Filters(step_size=0.001, min_qty=0.001, min_notional=20.0, tick_size=0.01)
 
 
 def test_rung_prices_span_support_to_resistance():

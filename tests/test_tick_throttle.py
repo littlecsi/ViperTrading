@@ -232,6 +232,7 @@ class LoopClient:
                     "filters": [
                         {"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
                         {"filterType": "MIN_NOTIONAL", "notional": "20"},
+                        {"filterType": "PRICE_FILTER", "tickSize": "0.01"},
                     ],
                 }
             ]
@@ -423,6 +424,16 @@ def test_zone_activation_places_a_full_ladder_of_limit_orders(monkeypatch, writt
     run_loop(monkeypatch, written, ticks=1, api=api)
     assert api.orders > 0
     assert all(o["type"] == "LIMIT" for o in api.placed_orders)
+
+
+def test_ladder_orders_are_placed_at_tick_rounded_prices(monkeypatch, written):
+    api = LoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, written, ticks=1, api=api)
+    for order in api.placed_orders:
+        if order.get("type") == "LIMIT":
+            # ETHUSDT tick size in this fixture is 0.01 -- every price must
+            # be an exact multiple, not a raw theoretical rung price.
+            assert round(order["price"] / 0.01) == pytest.approx(order["price"] / 0.01, abs=1e-6)
 
 
 def test_a_resting_ladder_is_placed_once_not_re_placed_every_tick(monkeypatch, written):

@@ -212,8 +212,9 @@ def _place_ladder(
         qty = execution.quantity_for(order.size, order.price, filters)
         if not execution.is_executable(qty, order.price, filters):
             continue
-        result = execution.place_limit_order(api, cfg.symbol, order.side, qty, order.price)
-        ladder_state.orders[order.price] = result["orderId"]
+        rounded_price = execution.price_for(order.price, filters)
+        result = execution.place_limit_order(api, cfg.symbol, order.side, qty, rounded_price)
+        ladder_state.orders[rounded_price] = result["orderId"]
 
 
 def _sleep(seconds) -> None:

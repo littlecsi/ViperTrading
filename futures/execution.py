@@ -32,6 +32,19 @@ def quantity_for(delta_notional: float, price: float, filters: Filters) -> float
     return round(qty, 8)
 
 
+def price_for(price: float, filters: Filters) -> float:
+    """Limit-order price floored to the exchange's tick size.
+
+    Mirrors quantity_for()'s rounding direction and rationale: the exchange
+    rejects a price that is not an exact multiple of tickSize with -1111,
+    and floats accumulate noise that a naive round() can push onto an
+    invalid tick. Floors rather than rounds to nearest so a BUY rung never
+    creeps above its intended price (which could turn a resting order
+    marketable) and a SELL rung never creeps below (same risk, mirrored)."""
+    ticks = math.floor(round(price / filters.tick_size, 8))
+    return round(ticks * filters.tick_size, 8)
+
+
 def is_executable(qty: float, price: float, filters: Filters) -> bool:
     if qty <= 0 or qty < filters.min_qty:
         return False

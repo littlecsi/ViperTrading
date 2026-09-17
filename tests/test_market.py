@@ -90,6 +90,16 @@ def test_get_filters_raises_when_lot_size_missing():
         market.get_filters(MissingFilterClient("LOT_SIZE"), "ETHUSDT")
 
 
+def test_get_filters_extracts_tick_size():
+    f = market.get_filters(FakeClient(), "ETHUSDT")
+    assert f.tick_size == 0.01
+
+
+def test_get_filters_raises_when_price_filter_missing():
+    with pytest.raises(ValueError, match="PRICE_FILTER"):
+        market.get_filters(MissingFilterClient("PRICE_FILTER"), "ETHUSDT")
+
+
 def test_wallet_balance_uses_total_not_available():
     assert market.wallet_balance_from(BALANCES) == 1000.0
 
