@@ -55,3 +55,74 @@ def rung_table(
         target = signed(target_notional(d, max_n, alpha), trend)
         rungs.append(Rung(price=price, cumulative_target=target))
     return tuple(rungs)
+
+
+@dataclass(frozen=True)
+class RungOrder:
+    price: float
+    size: float  # non-negative notional magnitude
+
+
+def build_rung_orders(
+    zone: Zone,
+    trend: str,
+    max_n: float,
+    alpha: float,
+    rung_spacing_pct: float,
+) -> tuple[RungOrder, ...]:
+    """One order per rung except the unfavourable edge (target is exactly 0
+    there, and that boundary already belongs to STOP_OUT/the dead-band
+    exit). Size is this rung's slice of the target curve -- the delta to its
+    neighbour on the unfavourable side -- which is why sell-side sizes near
+    that edge come out smaller than buy-side sizes near the favourable edge:
+    it falls directly out of the existing alpha curve. See design doc "Rung
+    table"."""
+    points = rung_table(zone, trend, max_n, alpha, rung_spacing_pct)
+    orders = []
+    if trend == LONG:
+        # resistance (last point) is the unfavourable edge; no order there.
+        for i in range(len(points) - 1):
+            size = abs(points[i].cumulative_target - points[i + 1].cumulative_target)
+            orders.append(RungOrder(price=points[i].price, size=size))
+    else:
+        # support (first point) is the unfavourable edge; no order there.
+        for i in range(1, len(points)):
+            size = abs(points[i].cumulative_target - points[i - 1].cumulative_target)
+            orders.append(RungOrder(price=points[i].price, size=size))
+    return tuple(orders)
+
+
+def side_for(rung_price: float, current_price: float, trend: str) -> str:
+    """BUY or SELL for a resting order at rung_price, given current market
+    price. For LONG, below current price accumulates (BUY); for SHORT,
+    accumulating (growing the short) happens as price rises toward the
+    favourable resistance, so the mapping mirrors. See design doc "Rung
+    table"."""
+    if trend == LONG:
+        return "BUY" if rung_price < current_price else "SELL"
+    return "SELL" if rung_price > current_price else "BUY"
+
+
+@dataclass(frozen=True)
+class DesiredOrder:
+    price: float
+    side: str
+    size: float
+
+
+def desired_orders(
+    zone: Zone,
+    trend: str,
+    max_n: float,
+    alpha: float,
+    rung_spacing_pct: float,
+    current_price: float,
+) -> tuple[DesiredOrder, ...]:
+    """The full set of resting orders the ladder wants right now, purely a
+    function of the zone and current price -- no fill history needed. A
+    rung's role flips between accumulate and trim automatically as price
+    moves, because side_for() only looks at where current price sits."""
+    return tuple(
+        DesiredOrder(price=rung.price, side=side_for(rung.price, current_price, trend), size=rung.size)
+        for rung in build_rung_orders(zone, trend, max_n, alpha, rung_spacing_pct)
+    )

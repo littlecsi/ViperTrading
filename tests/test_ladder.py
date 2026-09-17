@@ -66,3 +66,50 @@ def test_rung_table_target_is_negative_for_short():
     rungs = ladder.rung_table(ZONE, SHORT, max_n=5000.0, alpha=2.0, rung_spacing_pct=0.005)
     assert all(r.cumulative_target <= 0 for r in rungs)
     assert rungs[-1].cumulative_target == pytest.approx(-5000.0)  # resistance is favourable for short
+
+
+def test_build_rung_orders_sizes_are_positive_and_sum_to_max_n_for_long():
+    orders = ladder.build_rung_orders(ZONE, LONG, max_n=5000.0, alpha=2.0, rung_spacing_pct=0.005)
+    assert all(o.size >= 0 for o in orders)
+    assert sum(o.size for o in orders) == pytest.approx(5000.0)
+
+
+def test_build_rung_orders_excludes_the_unfavourable_edge_for_long():
+    # resistance (target=0) needs no order of its own.
+    orders = ladder.build_rung_orders(ZONE, LONG, max_n=5000.0, alpha=2.0, rung_spacing_pct=0.005)
+    assert ZONE.resistance not in [o.price for o in orders]
+    assert ZONE.support in [o.price for o in orders]
+
+
+def test_build_rung_orders_excludes_the_unfavourable_edge_for_short():
+    orders = ladder.build_rung_orders(ZONE, SHORT, max_n=5000.0, alpha=2.0, rung_spacing_pct=0.005)
+    assert ZONE.support not in [o.price for o in orders]
+    assert ZONE.resistance in [o.price for o in orders]
+    assert sum(o.size for o in orders) == pytest.approx(5000.0)
+
+
+def test_side_for_long_buys_below_current_price():
+    assert ladder.side_for(2400.0, current_price=2450.0, trend=LONG) == "BUY"
+
+
+def test_side_for_long_sells_above_current_price():
+    assert ladder.side_for(2500.0, current_price=2450.0, trend=LONG) == "SELL"
+
+
+def test_side_for_short_sells_above_current_price():
+    assert ladder.side_for(2500.0, current_price=2450.0, trend=SHORT) == "SELL"
+
+
+def test_side_for_short_buys_below_current_price():
+    assert ladder.side_for(2400.0, current_price=2450.0, trend=SHORT) == "BUY"
+
+
+def test_desired_orders_splits_buy_and_sell_by_current_price():
+    orders = ladder.desired_orders(
+        ZONE, LONG, max_n=5000.0, alpha=2.0, rung_spacing_pct=0.005, current_price=2500.0
+    )
+    for order in orders:
+        if order.price < 2500.0:
+            assert order.side == "BUY"
+        elif order.price > 2500.0:
+            assert order.side == "SELL"
