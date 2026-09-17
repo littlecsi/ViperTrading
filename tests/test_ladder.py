@@ -2,6 +2,7 @@ import math
 
 import pytest
 
+import execution
 import ladder
 from market import Filters, MarginTier
 from settings import Zone, LONG, SHORT
@@ -347,23 +348,45 @@ def test_plan_orders_places_missing_and_leaves_matching_alone():
         ladder.DesiredOrder(price=2400.0, side="BUY", size=100.0),
         ladder.DesiredOrder(price=2500.0, side="SELL", size=50.0),
     )
-    open_orders = [{"orderId": 1, "price": "2400.00", "side": "BUY", "origQty": "0.04167"}]
-    plan = ladder.plan_orders(desired, open_orders)
+    # origQty is what execution.quantity_for would actually have produced
+    # for this rung -- floored to the lot step, not the raw desired notional.
+    floored_qty = execution.quantity_for(100.0, 2400.0, FILTERS)
+    open_orders = [{"orderId": 1, "price": "2400.00", "side": "BUY", "origQty": str(floored_qty)}]
+    plan = ladder.plan_orders(desired, open_orders, FILTERS)
     assert plan.cancel == ()
     assert plan.place == (desired[1],)
 
 
 def test_plan_orders_cancels_stale_and_places_replacement():
     desired = (ladder.DesiredOrder(price=2400.0, side="BUY", size=150.0),)  # size changed
-    open_orders = [{"orderId": 1, "price": "2400.00", "side": "BUY", "origQty": "0.04167"}]  # was 100.0 notional
-    plan = ladder.plan_orders(desired, open_orders, price_tolerance=0.0001)
+    # Open order still reflects the OLD floored quantity (was size=100.0).
+    stale_qty = execution.quantity_for(100.0, 2400.0, FILTERS)
+    open_orders = [{"orderId": 1, "price": "2400.00", "side": "BUY", "origQty": str(stale_qty)}]
+    plan = ladder.plan_orders(desired, open_orders, FILTERS, price_tolerance=0.0001)
     assert plan.cancel == (1,)
     assert plan.place == (desired[0],)
 
 
 def test_plan_orders_cancels_orders_no_longer_desired():
     desired = ()
-    open_orders = [{"orderId": 1, "price": "2400.00", "side": "BUY", "origQty": "0.04167"}]
-    plan = ladder.plan_orders(desired, open_orders)
+    floored_qty = execution.quantity_for(100.0, 2400.0, FILTERS)
+    open_orders = [{"orderId": 1, "price": "2400.00", "side": "BUY", "origQty": str(floored_qty)}]
+    plan = ladder.plan_orders(desired, open_orders, FILTERS)
     assert plan.cancel == (1,)
+    assert plan.place == ()
+
+
+def test_plan_orders_leaves_alone_a_lot_step_floored_match_despite_raw_notional_gap():
+    # size=100.0 at price=2400.0 floors (via execution.quantity_for) to
+    # qty=0.041, i.e. actual notional 98.4 -- a ~1.6% gap from the raw
+    # desired notional that would blow straight through a tight relative
+    # tolerance on raw notional and churn a genuinely-unchanged rung on
+    # every tick. Comparing floored quantity instead correctly treats this
+    # as a match: no cancel, no replacement.
+    desired = (ladder.DesiredOrder(price=2400.0, side="BUY", size=100.0),)
+    floored_qty = execution.quantity_for(100.0, 2400.0, FILTERS)
+    assert floored_qty == pytest.approx(0.041)
+    open_orders = [{"orderId": 1, "price": "2400.00", "side": "BUY", "origQty": str(floored_qty)}]
+    plan = ladder.plan_orders(desired, open_orders, FILTERS)
+    assert plan.cancel == ()
     assert plan.place == ()

@@ -15,6 +15,7 @@ this module implements.
 import math
 from dataclasses import dataclass
 
+import execution
 from settings import Zone, LONG, SHORT
 from strategy import distance, target_notional, signed
 
@@ -316,27 +317,42 @@ class ReconciliationPlan:
 def plan_orders(
     desired: tuple[DesiredOrder, ...],
     open_orders: list[dict],
+    filters,  # market.Filters
     price_tolerance: float = 0.0001,
 ) -> ReconciliationPlan:
     """Diff the desired order set against what is actually open, minimizing
     churn: an open order matching a desired one (same side, price within
-    tolerance, and notional within that same tolerance) is left alone rather
-    than cancelled and replaced. Comparing notional as well as price and side
-    is what lets a rung whose size changed (e.g. a shifted liquidation cap)
-    get cancelled and replaced rather than mistaken for still current."""
+    tolerance, and quantity within one lot step) is left alone rather than
+    cancelled and replaced.
+
+    Quantity is compared, not raw notional, and via the SAME flooring the
+    exchange actually saw: execution.quantity_for(d.size, d.price, filters)
+    reproduces the floored qty execution.py would have sent when this rung
+    was originally placed. Comparing raw DesiredOrder.size against
+    price*origQty instead would fail for every genuinely-unchanged rung
+    whose notional does not floor to an exact multiple of the lot step (e.g.
+    size=100.0 at price=2400.0 floors to qty=0.041, i.e. notional=98.4 -- a
+    ~1.6% gap that blows through a tight relative tolerance on raw notional)
+    and would churn (cancel+replace) it every tick for no reason, which is
+    exactly the churn this function exists to avoid. Comparing notional as
+    well as price and side is still what lets a rung whose size genuinely
+    changed (e.g. a shifted liquidation cap) get cancelled and replaced
+    rather than mistaken for still current -- it just has to be compared
+    post-floor to tell "genuinely changed" apart from "same rung, lot-step
+    rounding noise"."""
     remaining_desired = list(desired)
     cancel = []
 
     for open_order in open_orders:
         open_price = float(open_order["price"])
         open_side = open_order["side"]
-        open_notional = open_price * float(open_order["origQty"])
+        open_qty = float(open_order["origQty"])
         match = next(
             (
                 d for d in remaining_desired
                 if d.side == open_side
                 and abs(d.price - open_price) <= price_tolerance * open_price
-                and abs(d.size - open_notional) <= price_tolerance * open_notional
+                and abs(execution.quantity_for(d.size, d.price, filters) - open_qty) <= filters.step_size / 2
             ),
             None,
         )
