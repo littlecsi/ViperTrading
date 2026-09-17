@@ -221,6 +221,7 @@ class LoopClient:
         self.order_error = order_error
         self.margin_type_error = margin_type_error
         self.orders = 0
+        self.placed_orders = []
         self.margin_type_calls = []
 
     def exchange_info(self):
@@ -246,12 +247,23 @@ class LoopClient:
         return [{"asset": "USDT", "balance": self._balance, "availableBalance": self._balance}]
 
     def get_position_risk(self, symbol=None):
-        return [{"symbol": "ETHUSDT", "positionAmt": "0.0", "unRealizedProfit": "0.0"}]
+        return [{
+            "symbol": "ETHUSDT", "positionAmt": "0.0", "unRealizedProfit": "0.0",
+            "liquidationPrice": "0.0", "entryPrice": "0.0", "isolatedWallet": "0.0",
+        }]
+
+    def get_orders(self, symbol):
+        # market.get_open_orders calls the connector's plural `get_orders`
+        # (GET /fapi/v1/openOrders), not the singular `get_open_order`.
+        return []
 
     def new_order(self, **params):
         self.orders += 1
+        self.placed_orders.append(params)
         if self.order_error is not None:
             raise RuntimeError(self.order_error(self.orders))
+        if params.get("type") == "LIMIT":
+            return {"orderId": self.orders, "status": "NEW"}
         return {"orderId": self.orders, "avgPrice": "0", "executedQty": "0", "cumQuote": "0"}
 
     def change_margin_type(self, symbol, marginType):
@@ -395,3 +407,15 @@ def test_startup_warns_but_continues_when_position_open(monkeypatch, written, ca
     run_loop(monkeypatch, written, ticks=1, api=api)
     output = capsys.readouterr().out
     assert "ISOLATED" in output.upper()
+
+
+# --- in-zone SCALE_IN/SCALE_OUT goes to the limit-order ladder -------------
+
+
+def test_zone_activation_places_a_full_ladder_of_limit_orders(monkeypatch, written):
+    # Price sits inside the middle of the configured zone ladder, trend long,
+    # zero starting position -> zone activates and the ladder places.
+    api = LoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, written, ticks=1, api=api)
+    assert api.orders > 0
+    assert all(o["type"] == "LIMIT" for o in api.placed_orders)

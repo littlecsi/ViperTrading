@@ -489,6 +489,30 @@ class Holding(loop.LoopClient):
         return {**result, "avgPrice": "1500.00", "executedQty": "1.0", "cumQuote": "1500.00"}
 
 
+class Trimming(loop.LoopClient):
+    """A client parked on the dead-band exit, for the repeated-FILL paths.
+
+    In-zone SCALE_IN/SCALE_OUT rests on the book as a limit-order ladder now, so
+    a client sitting inside a zone no longer produces the market-order fills
+    these tests are about. 3400 is above every resistance - off the ladder, but
+    nowhere near the adverse end that would HALT - so each tick decides the
+    dead-band SCALE_OUT, which still goes out as a MARKET order. The position is
+    deliberately left unchanged by the fill so the state repeats every tick,
+    which is what makes 'never throttled' meaningful: the tick record is a
+    verbatim repeat and only `forced` keeps it, one per order."""
+
+    def __init__(self, amt="1.0"):
+        super().__init__(price="3400.00", balance="1000.0")
+        self.amt = amt
+
+    def get_position_risk(self, symbol=None):
+        return [{"symbol": "ETHUSDT", "positionAmt": self.amt, "unRealizedProfit": "0.0"}]
+
+    def new_order(self, **params):
+        result = super().new_order(**params)
+        return {**result, "avgPrice": "3400.00", "executedQty": "1.0", "cumQuote": "3400.00"}
+
+
 def messages(events):
     return [text for kind, text in events if kind == "notify"]
 
@@ -570,7 +594,7 @@ def test_a_distinct_failure_notifies_the_instant_it_happens(monkeypatch, written
 
 def test_every_fill_notifies_exactly_once_never_throttled(monkeypatch, written, sent):
     """Sticky states throttle; fills do not. Each one moves real money."""
-    api = loop.LoopClient(balance="1000.0")
+    api = Trimming()
     loop.run_loop(monkeypatch, written, ticks=4, api=api)
 
     assert api.orders == len(sent) > 1
@@ -605,11 +629,17 @@ def test_a_second_departure_notifies_again(monkeypatch, written, sent):
             self.reads += 1
             return {"symbol": symbol, "price": price}
 
-    loop.run_loop(monkeypatch, written, ticks=9, api=Wandering())
+    api = Wandering()
+    loop.run_loop(monkeypatch, written, ticks=9, api=api)
 
     headlines = [text.split("\n")[0] for text in sent]
     assert headlines.count("HALT - price left the zone ladder") == 2
-    assert "ORDER FILLED" in headlines  # it traded again in between
+    # It was back on the ladder in between and acted there, which is what makes
+    # the second departure a new one rather than the first still latched. That
+    # activity is a limit-order ladder now, not a market fill, so there is no
+    # ORDER FILLED message to look for - the placement itself is the evidence.
+    assert api.orders > 0
+    assert all(o["type"] == "LIMIT" for o in api.placed_orders)
 
 
 def drive(monkeypatch, api, ticks):
@@ -640,7 +670,7 @@ def test_a_broken_notifier_costs_nothing_but_the_notification(monkeypatch, writt
     orders = []
     monkeypatch.setattr(journal, "log_order", lambda record, log_dir=None: orders.append(record))
 
-    api = loop.LoopClient(balance="1000.0")
+    api = Trimming()
     drive(monkeypatch, api, ticks=4)
 
     assert api.orders == len(orders) == 4  # every order placed, every one journalled

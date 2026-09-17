@@ -147,6 +147,39 @@ def _ascii(value) -> str:
     return str(value).encode("ascii", "replace").decode("ascii")
 
 
+def _place_ladder(
+    api, cfg, zone_index, price, max_n, filters, leverage_brackets, ladder_state
+) -> None:
+    """Compute the full desired order set for the active zone against current
+    price and zero starting position, and place every valid rung.
+
+    Used on zone ACTIVATION only - first entry into a zone, or the tick after a
+    STOP_OUT/HALT_FLATTEN market order cleared the position - so the position is
+    flat and the whole ladder can be placed fresh from the zone geometry alone,
+    with no fill history to reconcile against.
+
+    The liquidation cap is NOT applied here: against a flat position there is no
+    liquidation price to project from, and the cap is what the ongoing
+    reconciliation path recomputes each tick as fills accumulate. This is why
+    `leverage_brackets` is accepted but unused - the signature is the one the
+    reconciliation path shares.
+
+    A rung whose floored quantity cannot clear the exchange filters is skipped
+    rather than retried: a rung's notional is fixed by the zone geometry, so one
+    too small now is too small every tick."""
+    zone = cfg.zones[zone_index]
+    desired = ladder.desired_orders(
+        zone, cfg.trend, max_n, cfg.alpha, cfg.rung_spacing_pct, price
+    )
+    valid, _deferred = ladder.validate_orders(desired, price, cfg.trend, filters)
+    for order in valid:
+        qty = execution.quantity_for(order.size, order.price, filters)
+        if not execution.is_executable(qty, order.price, filters):
+            continue
+        result = execution.place_limit_order(api, cfg.symbol, order.side, qty, order.price)
+        ladder_state.orders[order.price] = result["orderId"]
+
+
 def _sleep(seconds) -> None:
     """Sleep the poll interval, clamped, and unable to raise.
 
@@ -454,6 +487,36 @@ def run() -> None:
                     "position_amt": position_amt,
                     "position_notional": position_notional,
                 }
+
+            # In-zone accumulation and trimming rest on the book as a ladder of
+            # limit orders instead of crossing the spread with a market order
+            # every tick. Only this case is routed away: STOP_OUT, HALT_FLATTEN
+            # and the dead-band SCALE_OUT (zone_index is None) are exits, where
+            # certainty of execution beats price, and they keep using execute()
+            # below exactly as before.
+            in_zone_ladder_case = (
+                decision.zone_index is not None
+                and decision.reason in (strategy.SCALE_IN, strategy.SCALE_OUT)
+            )
+
+            if in_zone_ladder_case:
+                # Placed on zone ACTIVATION only. A changed zone means the old
+                # zone's ladder is gone (the STOP_OUT that carried price here
+                # flattened the position), so its tracked rungs are discarded
+                # and a fresh set placed; an empty set with the zone unchanged
+                # is the first entry into it. An already-placed ladder is left
+                # resting - re-placing it every tick would cancel and re-send
+                # the same rungs for as long as price sat in the zone.
+                zone_changed = decision.zone_index != active_index
+                if zone_changed or not ladder_state.orders:
+                    ladder_state.reset()
+                    _place_ladder(
+                        api, cfg, decision.zone_index, price, decision.max_n,
+                        filters, leverage_brackets, ladder_state,
+                    )
+                active_index = decision.zone_index
+                _sleep(cfg.poll_seconds)
+                continue
 
             if not sending:
                 if halting:
