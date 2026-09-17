@@ -1,4 +1,5 @@
 import pytest
+from binance.error import ClientError
 
 import execution
 import strategy
@@ -157,3 +158,73 @@ def test_fill_from_response_reports_unknown_fill_as_none():
 
 def test_fill_from_response_tolerates_missing_fields():
     assert execution.fill_from_response({}) == execution.Fill(None, None, None)
+
+
+class LadderFakeClient(FakeClient):
+    def __init__(self, cancel_error: ClientError | None = None):
+        super().__init__()
+        self.cancel_error = cancel_error
+        self.cancelled = []
+
+    def cancel_order(self, symbol, orderId):
+        self.cancelled.append((symbol, orderId))
+        if self.cancel_error is not None:
+            raise self.cancel_error
+        return {"orderId": orderId, "status": "CANCELED"}
+
+    def query_order(self, symbol, orderId):
+        return {"orderId": orderId, "status": "FILLED", "avgPrice": "2400.0",
+                "executedQty": "0.041", "cumQuote": "98.4"}
+
+
+def test_place_limit_order_sends_gtc_limit():
+    c = FakeClient()
+    execution.place_limit_order(c, "ETHUSDT", "BUY", 0.041, 2400.0)
+    assert c.orders == [
+        {
+            "symbol": "ETHUSDT",
+            "side": "BUY",
+            "type": "LIMIT",
+            "quantity": 0.041,
+            "price": 2400.0,
+            "timeInForce": "GTC",
+        }
+    ]
+
+
+def test_place_limit_order_sets_reduce_only_when_requested():
+    c = FakeClient()
+    execution.place_limit_order(c, "ETHUSDT", "SELL", 0.041, 2400.0, reduce_only=True)
+    assert c.orders[0]["reduceOnly"] == "true"
+
+
+def test_place_limit_order_omits_reduce_only_by_default():
+    c = FakeClient()
+    execution.place_limit_order(c, "ETHUSDT", "BUY", 0.041, 2400.0)
+    assert "reduceOnly" not in c.orders[0]
+
+
+def test_cancel_orders_cancels_each_id():
+    c = LadderFakeClient()
+    results = execution.cancel_orders(c, "ETHUSDT", [1, 2, 3])
+    assert c.cancelled == [("ETHUSDT", 1), ("ETHUSDT", 2), ("ETHUSDT", 3)]
+    assert [r["status"] for r in results] == ["CANCELED", "CANCELED", "CANCELED"]
+
+
+def test_cancel_orders_tolerates_already_gone():
+    c = LadderFakeClient(cancel_error=ClientError(400, -2011, "Unknown order sent.", {}))
+    results = execution.cancel_orders(c, "ETHUSDT", [1])
+    assert results == [{"orderId": 1, "status": "already_gone"}]
+
+
+def test_cancel_orders_raises_other_errors():
+    c = LadderFakeClient(cancel_error=ClientError(400, -1021, "Timestamp", {}))
+    with pytest.raises(ClientError):
+        execution.cancel_orders(c, "ETHUSDT", [1])
+
+
+def test_query_order_result_returns_raw_response():
+    c = LadderFakeClient()
+    result = execution.query_order_result(c, "ETHUSDT", 5)
+    assert result["status"] == "FILLED"
+    assert result["orderId"] == 5

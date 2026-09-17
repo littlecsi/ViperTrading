@@ -1,6 +1,8 @@
 import math
 from dataclasses import dataclass
 
+from binance.error import ClientError
+
 from market import Filters
 from strategy import HALT_FLATTEN, STOP_OUT
 
@@ -124,3 +126,50 @@ def execute(
     if reduce_only:
         params["reduceOnly"] = "true"
     return client.new_order(**params)
+
+
+def place_limit_order(
+    client,
+    symbol: str,
+    side: str,
+    qty: float,
+    price: float,
+    reduce_only: bool = False,
+) -> dict:
+    """Place a resting GTC limit order. Used only for in-zone SCALE_IN/
+    SCALE_OUT rungs -- STOP_OUT/HALT_FLATTEN/dead-band exits keep using
+    execute() (market), unchanged, per the design doc."""
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "LIMIT",
+        "quantity": qty,
+        "price": price,
+        "timeInForce": "GTC",
+    }
+    if reduce_only:
+        params["reduceOnly"] = "true"
+    return client.new_order(**params)
+
+
+def cancel_orders(client, symbol: str, order_ids) -> list[dict]:
+    """Cancel each id, tolerating one already gone (-2011) rather than
+    raising: the bot's tracked rung state is read once a tick and can be one
+    poll stale relative to the exchange, e.g. if a rung filled between the
+    diff read and the cancel call."""
+    results = []
+    for order_id in order_ids:
+        try:
+            results.append(client.cancel_order(symbol=symbol, orderId=order_id))
+        except ClientError as exc:
+            if exc.error_code == -2011:
+                results.append({"orderId": order_id, "status": "already_gone"})
+            else:
+                raise
+    return results
+
+
+def query_order_result(client, symbol: str, order_id) -> dict:
+    """Raw exchange response for one order, used to tell a filled rung from
+    a cancelled one and to extract its fill via fill_from_response()."""
+    return client.query_order(symbol=symbol, orderId=order_id)
