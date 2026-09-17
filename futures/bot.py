@@ -158,11 +158,16 @@ def _place_ladder(
     flat and the whole ladder can be placed fresh from the zone geometry alone,
     with no fill history to reconcile against.
 
-    The liquidation cap is NOT applied here: against a flat position there is no
-    liquidation price to project from, and the cap is what the ongoing
-    reconciliation path recomputes each tick as fills accumulate. This is why
-    `leverage_brackets` is accepted but unused - the signature is the one the
-    reconciliation path shares.
+    The accumulate side is capped by the liquidation guard before anything is
+    placed. This is the single largest burst of accumulation the bot ever
+    commits to - every rung in the zone at once - so it is the last place that
+    should go out unguarded. The position is guaranteed flat here, so
+    `position_qty=0` is passed to the cap; `entry_price` and `isolated_wallet`
+    are mathematically inert at that point, since every term of the formula
+    using them is multiplied by `position_qty`, so 0 is a correct value for
+    both rather than a placeholder guess. `planned_delta_qty` and
+    `planned_delta_notional` are real, and they are exactly the accumulation
+    the cap exists to protect against.
 
     A rung whose floored quantity cannot clear the exchange filters is skipped
     rather than retried: a rung's notional is fixed by the zone geometry, so one
@@ -171,6 +176,37 @@ def _place_ladder(
     desired = ladder.desired_orders(
         zone, cfg.trend, max_n, cfg.alpha, cfg.rung_spacing_pct, price
     )
+
+    # Scale the accumulate side down until filling EVERY one of its rungs at
+    # the planned size could not push the projected liquidation price past the
+    # level this position has to survive to (the next zone, less the buffer).
+    # planned_delta_qty is the total notional over CURRENT price rather than a
+    # per-rung sum over each rung's own price. That understates the quantity -
+    # the rungs accumulate at prices better than current - and understating
+    # quantity overstates the average entry, which for the accumulate side
+    # projects a liquidation nearer the adverse side than the real one. The
+    # approximation therefore errs toward capping too hard, never too little.
+    accumulate_side = "BUY" if cfg.trend == settings.LONG else "SELL"
+    planned_notional = sum(o.size for o in desired if o.side == accumulate_side)
+    if planned_notional > 0:
+        survival = ladder.survival_price(
+            cfg.zones, zone_index, cfg.trend, cfg.liquidation_buffer_pct
+        )
+        tier = market.maintenance_tier_from(leverage_brackets, planned_notional)
+        scale = ladder.liquidation_scale(
+            position_qty=0.0,
+            entry_price=0.0,
+            isolated_wallet=0.0,
+            leverage=cfg.leverage,
+            tier=tier,
+            survival_price=survival,
+            planned_delta_qty=planned_notional / price,
+            planned_delta_notional=planned_notional,
+            trend=cfg.trend,
+        )
+        if scale < 1.0:
+            desired = ladder.apply_liquidation_cap(desired, scale, cfg.trend)
+
     valid, _deferred = ladder.validate_orders(desired, price, cfg.trend, filters)
     for order in valid:
         qty = execution.quantity_for(order.size, order.price, filters)

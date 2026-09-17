@@ -467,6 +467,28 @@ def test_a_partly_rejected_ladder_is_not_re_placed_every_tick(monkeypatch, writt
     assert len(api.placed_orders) == 5
 
 
+def test_the_activation_ladder_is_capped_by_the_liquidation_guard(monkeypatch, written):
+    """The activation ladder is the largest burst of accumulation the bot ever
+    commits to - every rung in the zone at once - so it is capped like any
+    other. At 5x the whole ladder still survives down to the next zone and
+    every accumulate rung is placed. At 10x the projected liquidation sits the
+    wrong side of that level, so the cap takes the accumulate side to nothing
+    while leaving the trim side - which reduces risk - alone."""
+    safe = LoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, written, ticks=1, api=safe)
+    safe_sides = [o["side"] for o in safe.placed_orders]
+    assert safe_sides.count("BUY") > 0  # uncapped: the accumulate side goes out
+
+    risky_cfg = bot.settings.Settings(**{**bot.settings.load().__dict__, "leverage": 10})
+    risky = LoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, [], ticks=1, api=risky, load=lambda: risky_cfg)
+    risky_sides = [o["side"] for o in risky.placed_orders]
+    assert risky_sides.count("BUY") == 0  # capped away entirely
+    # Not simply "nothing was placed": the trim side is untouched by the cap,
+    # which is what makes this a cap and not a refusal to trade the zone.
+    assert risky_sides.count("SELL") > 0
+
+
 def test_a_fully_rejected_ladder_still_retries_next_tick(monkeypatch, written):
     """The other half of the partial-failure rule: when NOTHING was accepted
     there is nothing resting to duplicate, so the tracked set stays empty and
