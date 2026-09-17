@@ -94,6 +94,15 @@ class LadderState:
         self.orders: dict[float, int] = {}  # rung price -> open order id
         self.settling = False
         self.settling_snapshot: frozenset = frozenset()
+        # Did the last placement attempt send nothing at all? An attempt that
+        # the liquidation cap blocks entirely leaves `orders` empty, which is
+        # the same condition that triggered the attempt - so the loop attempts
+        # again next tick, and every tick after, for as long as the position
+        # stays unsafe. That is correct (the block must lift the moment the
+        # position recovers) but it is not the loop ACTING, and forcing a tick
+        # record on it would write a line per poll for the whole of it - the
+        # flood TickLog exists to prevent. See run()'s `acting`.
+        self.blocked = False
 
     def reset(self) -> None:
         self.__init__()
@@ -147,27 +156,65 @@ def _ascii(value) -> str:
     return str(value).encode("ascii", "replace").decode("ascii")
 
 
+def _liquidation_breached(trend, liquidation_price, survival_price) -> bool:
+    """Has the exchange's OWN reported liquidation price already passed the
+    level this position has to survive to?
+
+    Ground truth, and it overrides ladder.liquidation_scale's projection
+    wherever the two disagree - which they do, in one direction that matters.
+    The projection knows the accumulate rungs sit on the favourable side of
+    current price, so filling them improves the average entry and moves the
+    blended liquidation back to safety; it will therefore answer "this
+    accumulation is safe" for a position the exchange already reports as past
+    its survival level. That answer is about where the position would END UP,
+    and it is no reason to add to a position that cannot survive the trip
+    there. This function is about where it stands NOW.
+
+    A reported price of 0 means "no figure" - a flat position, or a symbol the
+    account has never traded - and is not a breach. Reading it as one would be
+    a permanent false positive on the SHORT side, where any real liquidation
+    price is above 0."""
+    if liquidation_price <= 0:
+        return False
+    if trend == settings.LONG:
+        return liquidation_price >= survival_price
+    return liquidation_price <= survival_price
+
+
 def _place_ladder(
-    api, cfg, zone_index, price, max_n, filters, leverage_brackets, ladder_state
+    api, cfg, zone_index, price, snapshot, max_n, filters, leverage_brackets,
+    ladder_state
 ) -> None:
     """Compute the full desired order set for the active zone against current
-    price and zero starting position, and place every valid rung.
+    price and the CURRENT position, and place every valid rung.
 
-    Used on zone ACTIVATION only - first entry into a zone, or the tick after a
-    STOP_OUT/HALT_FLATTEN market order cleared the position - so the position is
-    flat and the whole ladder can be placed fresh from the zone geometry alone,
-    with no fill history to reconcile against.
+    Placed when nothing is tracked for the active zone: the first entry into
+    it, the tick after a STOP_OUT/HALT_FLATTEN market order cleared the
+    position, or a zone change. In the common case that means a flat position
+    and a ladder built fresh from the zone geometry alone, with no fill history
+    to reconcile against.
 
     The accumulate side is capped by the liquidation guard before anything is
     placed. This is the single largest burst of accumulation the bot ever
     commits to - every rung in the zone at once - so it is the last place that
-    should go out unguarded. The position is guaranteed flat here, so
-    `position_qty=0` is passed to the cap; `entry_price` and `isolated_wallet`
-    are mathematically inert at that point, since every term of the formula
-    using them is multiplied by `position_qty`, so 0 is a correct value for
-    both rather than a placeholder guess. `planned_delta_qty` and
-    `planned_delta_notional` are real, and they are exactly the accumulation
-    the cap exists to protect against.
+    should go out unguarded, and the cap is evaluated against the position that
+    is REALLY open, read off this tick's snapshot.
+
+    Passing zeros here instead - on the reasoning that placement only ever
+    happens from flat - is wrong, and wrong in the one direction that matters.
+    An empty tracked set is not the same fact as a flat position: the
+    liquidation backstop empties the tracked set by cancelling the accumulate
+    side WITHOUT closing anything, so the very next tick re-enters placement
+    holding a position that is, by construction, near enough to liquidation
+    that the backstop fired on it. Evaluated as flat, the cap would hand back
+    a scale the real position does not justify and re-place the accumulate
+    side the backstop had just pulled - a full ladder cancelled and re-placed
+    every poll, while the account is at its least able to afford it. On a
+    genuine activation the snapshot's values are the zeros anyway, so reading
+    them costs nothing and assumes nothing.
+
+    `planned_delta_qty` and `planned_delta_notional` are the accumulation the
+    cap exists to protect against.
 
     A rung whose floored quantity cannot clear the exchange filters is skipped
     rather than retried: a rung's notional is fixed by the zone geometry, so one
@@ -193,17 +240,27 @@ def _place_ladder(
             cfg.zones, zone_index, cfg.trend, cfg.liquidation_buffer_pct
         )
         tier = market.maintenance_tier_from(leverage_brackets, planned_notional)
-        scale = ladder.liquidation_scale(
-            position_qty=0.0,
-            entry_price=0.0,
-            isolated_wallet=0.0,
-            leverage=cfg.leverage,
-            tier=tier,
-            survival_price=survival,
-            planned_delta_qty=planned_notional / price,
-            planned_delta_notional=planned_notional,
-            trend=cfg.trend,
-        )
+        if _liquidation_breached(cfg.trend, snapshot.liquidation_price, survival):
+            # Whatever the projection would say, the exchange reports this
+            # position as already past the level it has to survive to. Without
+            # this the backstop's cancellation does not stick: where the whole
+            # ladder is accumulate-side, the backstop empties the tracked set,
+            # this path runs again next tick, the projection answers 1.0
+            # because the rungs would improve the average entry, and the full
+            # ladder goes straight back on the book - once per poll.
+            scale = 0.0
+        else:
+            scale = ladder.liquidation_scale(
+                position_qty=abs(snapshot.position_amt),
+                entry_price=snapshot.entry_price,
+                isolated_wallet=snapshot.isolated_wallet,
+                leverage=cfg.leverage,
+                tier=tier,
+                survival_price=survival,
+                planned_delta_qty=planned_notional / price,
+                planned_delta_notional=planned_notional,
+                trend=cfg.trend,
+            )
         if scale < 1.0:
             desired = ladder.apply_liquidation_cap(desired, scale, cfg.trend)
 
@@ -215,6 +272,11 @@ def _place_ladder(
         rounded_price = execution.price_for(order.price, filters, order.side)
         result = execution.place_limit_order(api, cfg.symbol, order.side, qty, rounded_price)
         ladder_state.orders[rounded_price] = result["orderId"]
+
+    # Recorded AFTER the loop, so a placement that raised partway leaves the
+    # flag alone: some rungs are live, the tracked set is non-empty, and the
+    # next tick will not attempt a placement at all.
+    ladder_state.blocked = not ladder_state.orders
 
 
 def _cancel_ladder(api, cfg, ladder_state) -> None:
@@ -322,7 +384,14 @@ def _reconcile_ladder(
     # scale 0.0 for an already-unsafe position and push a LIQUIDATION BRAKE
     # notification per reconcile that named no rung it had actually shrunk.
     scale = 1.0
-    if planned_delta_notional > 0:
+    if planned_delta_notional > 0 and _liquidation_breached(
+        cfg.trend, snapshot.liquidation_price, survival
+    ):
+        # Same override as the activation path: the exchange's reported price
+        # beats the projection, so a reconcile cannot put back the accumulate
+        # side the backstop has just taken off.
+        scale = 0.0
+    elif planned_delta_notional > 0:
         scale = ladder.liquidation_scale(
             position_qty=position_qty,
             entry_price=snapshot.entry_price,
@@ -688,7 +757,23 @@ def run() -> None:
             # it was built for. A resting ladder is a sustained state like any
             # other and throttles to one line a minute; the tick that actually
             # places the ladder is a transition, and is always written.
-            acting = placing_ladder if in_zone_ladder_case else sending
+            #
+            # `ladder_state.blocked` subtracts the other half of the same
+            # mistake: a placement the liquidation cap blocks ENTIRELY sends
+            # nothing and leaves the tracked set empty, so the next tick reads
+            # the same "no ladder yet" condition and attempts again, forever,
+            # while the position stays unsafe. Attempting is not acting, and
+            # forcing on it floods exactly as a resting ladder used to. The
+            # cost is that the tick which eventually DOES place, once the
+            # position recovers, is not forced either - it is still written,
+            # but by the interval rather than immediately, so up to
+            # TICK_LOG_INTERVAL_SECONDS late. A bounded delay on one record
+            # beats a record per poll for as long as the block lasts.
+            acting = (
+                placing_ladder and not ladder_state.blocked
+                if in_zone_ladder_case
+                else sending
+            )
 
             tick_log.log(
                 {
@@ -821,8 +906,9 @@ def run() -> None:
                     if placing_ladder:
                         ladder_state.reset()
                         _place_ladder(
-                            api, cfg, decision.zone_index, price, decision.max_n,
-                            filters, leverage_brackets, ladder_state,
+                            api, cfg, decision.zone_index, price, snapshot,
+                            decision.max_n, filters, leverage_brackets,
+                            ladder_state,
                         )
                     elif ladder_state.settling:
                         # Checked BEFORE _detect_fill, and the order is load
@@ -914,19 +1000,17 @@ def run() -> None:
                 # figure for this symbol, not a liquidation at zero: for a
                 # short, "0 <= survival" would otherwise read as a permanent
                 # breach.
-                if ladder_state.orders and snapshot.position_amt != 0 and (
-                    snapshot.liquidation_price > 0
-                ):
+                if ladder_state.orders and snapshot.position_amt != 0:
                     survival = ladder.survival_price(
                         cfg.zones, decision.zone_index, cfg.trend,
                         cfg.liquidation_buffer_pct,
                     )
-                    breached = (
-                        snapshot.liquidation_price >= survival
-                        if cfg.trend == settings.LONG
-                        else snapshot.liquidation_price <= survival
-                    )
-                    if breached:
+                    # The same predicate the two placement paths use to refuse
+                    # the accumulate side, so what this cancels cannot be put
+                    # straight back by the next tick.
+                    if _liquidation_breached(
+                        cfg.trend, snapshot.liquidation_price, survival
+                    ):
                         accumulate_side = "BUY" if cfg.trend == settings.LONG else "SELL"
                         to_cancel = [
                             o["orderId"]

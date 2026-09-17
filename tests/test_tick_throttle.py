@@ -217,7 +217,8 @@ class LoopClient:
 
     def __init__(self, price="2700.00", balance="0.0", order_error=None, margin_type_error=None,
                  price_schedule=None, position="0.0", cancel_error=None,
-                 open_orders_after_tick=None):
+                 open_orders_after_tick=None, entry_price="0.0",
+                 isolated_wallet="0.0", liquidation_price="0.0"):
         self.price = price
         # {ticker_price call number: new price}. bot.run() has no supported
         # pause/resume, so walking price across a zone boundary inside ONE
@@ -227,6 +228,14 @@ class LoopClient:
         self.price_reads = 0
         self._balance = balance
         self.position = position
+        # The rest of the position-risk payload. Default zeros describe a flat
+        # account; a test that wants a LIVE position sets `position` together
+        # with the entry price and isolated margin behind it, because the
+        # liquidation cap reads all three and a non-flat position with a zero
+        # entry price is not a state the exchange can report.
+        self.entry_price = entry_price
+        self.isolated_wallet = isolated_wallet
+        self.liquidation_price = liquidation_price
         self.order_error = order_error
         self.cancel_error = cancel_error
         self.margin_type_error = margin_type_error
@@ -277,7 +286,9 @@ class LoopClient:
         return [{
             "symbol": symbol or "ETHUSDT", "positionAmt": self.position,
             "unRealizedProfit": "0.0",
-            "liquidationPrice": "0.0", "entryPrice": "0.0", "isolatedWallet": "0.0",
+            "liquidationPrice": self.liquidation_price,
+            "entryPrice": self.entry_price,
+            "isolatedWallet": self.isolated_wallet,
         }]
 
     @property
@@ -570,6 +581,94 @@ def test_the_activation_ladder_is_capped_by_the_liquidation_guard(monkeypatch, w
     assert risky_sides.count("SELL") > 0
 
 
+def test_the_placement_cap_reads_the_real_position_not_an_assumed_flat_one(
+    monkeypatch, written
+):
+    """_place_ladder runs whenever the tracked set is empty, which is NOT the
+    same as "the position is flat". The liquidation backstop empties the
+    tracked set by cancelling the accumulate side WITHOUT closing anything, so
+    the very next tick re-enters placement holding a position that is, by
+    construction, close enough to liquidation for the backstop to have fired.
+    Computing the cap against an assumed-flat position there would return a
+    scale the real position does not justify and re-place the accumulate side
+    the backstop had just taken off - cancelling and re-placing a full ladder
+    every poll while the account is at its least able to afford it.
+
+    The position here - 1.8 ETH entered at 2500 with its isolated margin
+    eroded to 50 USDT, putting liquidation at ~2497 against a mark of 2500 and
+    a survival target of 2271.50 - is one the cap scales to 0.0 when evaluated
+    honestly. The SAME ladder against a flat position is uncapped at 1.0; see
+    test_the_activation_ladder_is_capped_by_the_liquidation_guard, which uses
+    the same zone, price, balance and leverage. So a BUY rung on the book
+    after this tick means the cap was computed against a fiction."""
+    api = LoopClient(
+        price="2500.00", balance="1000.0",
+        position="1.8", entry_price="2500.00", isolated_wallet="50.00",
+    )
+    records = run_loop(monkeypatch, written, ticks=1, api=api)
+
+    assert "error" not in actions(records)
+    sides = [o["side"] for o in api.placed_orders if o.get("type") == "LIMIT"]
+    assert sides.count("BUY") == 0  # capped away by the REAL position's risk
+    # The trim side reduces the very exposure that triggered the cap, so it is
+    # untouched - this is a cap, not a refusal to work the zone.
+    assert sides.count("SELL") > 0
+
+
+def test_the_backstops_cancellation_is_not_undone_by_the_next_placement(
+    monkeypatch, written
+):
+    """The other half of reading the real position: placement must also respect
+    the exchange's REPORTED liquidation price, not only its own projection.
+
+    The two can disagree. The projection knows the accumulate rungs sit below
+    the current price, so filling them lowers the average entry and can move
+    the blended liquidation to safety - it therefore answers "safe" for a
+    position the exchange already reports as past its survival level. Where the
+    whole ladder is accumulate-side (price near the zone's upper edge, so no
+    rung sits above it), the backstop cancels every rung, the tracked set
+    empties, placement runs again next tick, the projection says 1.0 and the
+    full ladder goes straight back on the book - measured at 380 orders over 20
+    ticks before this was fixed, one full ladder placed and cancelled per poll,
+    on an account already past the level the backstop exists to defend.
+
+    The reported price is ground truth for where the position stands NOW, so it
+    overrides the projection in both directions: it stops the accumulate side
+    going out at all, which is what makes the backstop's cancellation stick."""
+    api = LoopClient(
+        price="2600.00", balance="1000.0",
+        position="1.8", entry_price="2800.00", isolated_wallet="700.00",
+        # Above the zone-1 survival target of 2271.50: already breached.
+        liquidation_price="2435.00",
+    )
+    records = run_loop(monkeypatch, written, ticks=20, api=api)
+
+    assert "error" not in actions(records)
+    sides = [o["side"] for o in api.placed_orders if o.get("type") == "LIMIT"]
+    assert sides.count("BUY") == 0
+    assert api.cancelled_order_ids == []  # nothing placed, so nothing to pull
+
+
+def test_a_fully_blocked_placement_does_not_flood_the_tick_journal(monkeypatch, written):
+    """The sustained state the fix above creates. A placement blocked in full
+    sends nothing, so the tracked set stays empty, so the NEXT tick reads the
+    same "no ladder yet" condition and attempts again - every poll, for as long
+    as the position stays past its survival level. Attempting is not acting: a
+    forced record there is the same line-per-poll flood a resting ladder used
+    to produce, in the same walked-away-operator case, and the position is
+    unsafe throughout it. The state is sustained, so it throttles like one."""
+    api = LoopClient(
+        price="2600.00", balance="1000.0",
+        position="1.8", entry_price="2800.00", isolated_wallet="700.00",
+        liquidation_price="2435.00",
+    )
+    records = run_loop(monkeypatch, written, ticks=300, api=api)
+
+    ladder_ticks = [r for r in records if r.get("reason") == strategy.SCALE_OUT]
+    assert len(ladder_ticks) == 5  # 300 polls at 1s, not 300 records
+    assert api.orders == 0  # and nothing went to the exchange either
+
+
 def test_a_fully_rejected_ladder_still_retries_next_tick(monkeypatch, written):
     """The other half of the partial-failure rule: when NOTHING was accepted
     there is nothing resting to duplicate, so the tracked set stays empty and
@@ -721,22 +820,42 @@ def test_settling_waits_while_the_open_order_set_is_still_changing(monkeypatch, 
 # said (design doc, "Liquidation-aware buy-side cap", point 4).
 
 
+def test_liquidation_breached_reads_both_trends_and_a_missing_figure():
+    """The predicate shared by the two placement paths and the backstop. A LONG
+    liquidates BELOW, so its reported price breaching means rising to meet the
+    survival level; a SHORT liquidates ABOVE and breaches by falling to it. A
+    reported 0 is 'no figure', never a breach - read literally it would put
+    every SHORT in permanent breach."""
+    assert bot._liquidation_breached(bot.settings.LONG, 2300.0, 2271.5) is True
+    assert bot._liquidation_breached(bot.settings.LONG, 2200.0, 2271.5) is False
+    assert bot._liquidation_breached(bot.settings.SHORT, 2600.0, 2728.5) is True
+    assert bot._liquidation_breached(bot.settings.SHORT, 2800.0, 2728.5) is False
+    assert bot._liquidation_breached(bot.settings.SHORT, 0.0, 2728.5) is False
+    assert bot._liquidation_breached(bot.settings.LONG, 0.0, 2271.5) is False
+
+
 class BreachedLoopClient(LoopClient):
-    """A live long whose reported liquidation price is already above the
-    survival target for zone 1 (2371.26 - 0.2 * the next zone's span = 2271.50)."""
+    """A live long whose reported liquidation price crosses the zone-1 survival
+    target (2371.26 - 0.2 * the next zone's span = 2271.50) partway through the
+    run, which is the order events really happen in: the ladder goes on the book
+    while the position is fine, and the market then moves against it.
+
+    Breaching from the START would be a different test - the placement paths
+    refuse the accumulate side outright while the reported price is breached, so
+    there would be no BUY rungs on the book for the backstop to take off."""
 
     def get_position_risk(self, symbol=None):
         return [{
             "symbol": symbol or "ETHUSDT", "positionAmt": "1.0",
             "unRealizedProfit": "0.0",
-            "liquidationPrice": "2495.00",
+            "liquidationPrice": "2495.00" if self._tick > 1 else "2000.00",
             "entryPrice": "2500.00", "isolatedWallet": "500.00",
         }]
 
 
 def test_liquidation_backstop_cancels_remaining_accumulate_rungs(monkeypatch, written):
     api = BreachedLoopClient(price="2500.00", balance="1000.0")
-    records = run_loop(monkeypatch, written, ticks=1, api=api)
+    records = run_loop(monkeypatch, written, ticks=2, api=api)
     assert "error" not in actions(records)
 
     limits = [(i + 1, p) for i, p in enumerate(api.placed_orders) if p.get("type") == "LIMIT"]
