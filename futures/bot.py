@@ -5,6 +5,7 @@ from dataclasses import asdict, fields, is_dataclass
 import client
 import execution
 import journal
+import ladder
 import market
 import notify
 import settings
@@ -81,6 +82,21 @@ class TickLog:
         self._last_key = key
         self._last_at = now
         return True
+
+
+class LadderState:
+    """Mutable ladder-lifecycle state for the CURRENTLY active zone. Reset
+    to a fresh instance whenever the active zone changes (STOP_OUT/HALT
+    market-flattens the old zone's position, so its ladder starts over from
+    an empty state on the new zone) - see design doc "Lifecycle"."""
+
+    def __init__(self):
+        self.orders: dict[float, int] = {}  # rung price -> open order id
+        self.settling = False
+        self.settling_snapshot: frozenset = frozenset()
+
+    def reset(self) -> None:
+        self.__init__()
 
 
 def _config_changes(old, new) -> dict:
@@ -160,6 +176,7 @@ def run() -> None:
             "can retry."
         )
     filters = market.get_filters(api, cfg.symbol)
+    leverage_brackets = market.get_leverage_brackets(api, cfg.symbol)
 
     label = "TESTNET" if cfg.testnet else "LIVE"
     print(f"Viper starting on {label} - {cfg.symbol} @ {cfg.leverage}x, trend={cfg.trend}")
@@ -203,6 +220,7 @@ def run() -> None:
 
     active_index = None
     halted = False
+    ladder_state = LadderState()
     # One write policy per record stream. They must not share: the streams
     # interleave within a tick, so through a single log each record would look
     # like a change from the last one written and none of them would throttle.
@@ -295,6 +313,7 @@ def run() -> None:
                                     "CROSSED mode."
                                 )
                             filters = new_filters
+                            leverage_brackets = market.get_leverage_brackets(api, new_cfg.symbol)
                             # Zone state belongs to the old symbol's ladder and
                             # means nothing on the new one.
                             active_index = None

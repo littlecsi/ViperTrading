@@ -259,6 +259,12 @@ class LoopClient:
         if self.margin_type_error is not None:
             raise self.margin_type_error
 
+    def leverage_brackets(self, symbol):
+        return [{"symbol": symbol, "brackets": [
+            {"bracket": 1, "initialLeverage": 20, "notionalCap": 50000.0,
+             "notionalFloor": 0.0, "maintMarginRatio": 0.01, "cum": 0.0},
+        ]}]
+
 
 def run_loop(monkeypatch, written, ticks, api=None, load=None):
     """Run bot.run() for `ticks` polls on a fake clock, returning the records."""
@@ -328,6 +334,22 @@ def test_repeated_order_rejection_collapses(monkeypatch, written):
 
     assert api.orders == 300  # the bot kept trying, as it should
     assert actions(records)["error"] == 5
+
+
+def test_leverage_brackets_are_fetched_once_at_startup(monkeypatch, written):
+    api = LoopClient()
+    api.leverage_bracket_calls = []
+
+    def leverage_brackets(symbol):
+        api.leverage_bracket_calls.append(symbol)
+        return [{"symbol": symbol, "brackets": [
+            {"bracket": 1, "initialLeverage": 20, "notionalCap": 50000.0,
+             "notionalFloor": 0.0, "maintMarginRatio": 0.01, "cum": 0.0},
+        ]}]
+
+    monkeypatch.setattr(api, "leverage_brackets", leverage_brackets, raising=False)
+    run_loop(monkeypatch, written, ticks=5, api=api)
+    assert api.leverage_bracket_calls == ["ETHUSDT"]  # once, not once per tick
 
 
 def test_a_different_error_is_written_immediately(monkeypatch, written):
