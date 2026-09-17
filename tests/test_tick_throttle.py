@@ -1200,6 +1200,80 @@ def test_a_fill_taken_out_by_a_halt_is_still_journalled(monkeypatch, written):
     assert [r["order_id"] for r in ladder_fills] == [all_ids[0]]
 
 
+def test_the_reconciles_fill_pushes_wait_for_its_own_orders(monkeypatch, written):
+    """Journalled immediately, pushed only once the rebuild is on the book.
+
+    Every Telegram call is worth up to notify.TIMEOUT_SECONDS of blocking HTTP,
+    and a reconcile that has fills to report is by definition one with rungs to
+    replace - the deeper the cascade, the more of both. Sent inline, a full
+    ladder's worth of timeouts would sit in front of the rebuild and then push
+    the next tick's HALT check and liquidation backstop out behind them, with a
+    leveraged position open. The same rule the liquidation brake and the
+    failed-cancel push in this file already follow."""
+    order_journal = []
+    all_ids = resting_ladder_ids(monkeypatch)
+
+    api = LoopClient(
+        price="2500.00", balance="1000.0",
+        open_orders_after_tick={
+            2: [i for i in all_ids if i != all_ids[0]],
+            3: [i for i in all_ids if i not in all_ids[:2]],
+        },
+    )
+    # Into the same timeline as the exchange calls - the only way to see WHERE
+    # the push happened relative to the orders this pass sent.
+    monkeypatch.setattr(
+        bot.notify, "order_executed",
+        lambda record: api.events.append(("notify", record["order_id"])),
+    )
+    run_loop(monkeypatch, written, ticks=4, api=api, orders=order_journal)
+
+    pushed = [i for i, (kind, _) in enumerate(api.events) if kind == "notify"]
+    placed = [i for i, (kind, _) in enumerate(api.events) if kind == "place"]
+    assert len(pushed) == 2  # both fills still reach Telegram
+    assert len(order_journal) == 2
+    # The reconcile's own placements are all in front of its push. The FIRST
+    # push is the detect tick's, which sends no orders at all and is free to
+    # fire inline; the second is the deferred one.
+    assert pushed[-1] > placed[-1]
+
+
+def test_a_journal_failure_in_the_fill_lookup_handler_cannot_strand_the_ladder(
+    monkeypatch, written
+):
+    """The error path's own record opens a file, and a locked or full one
+    raising there escapes before the detect branch arms the settling wait -
+    leaving a ladder that can never reconcile, for as long as the failure
+    lasts, under one throttled error message a minute."""
+    order_journal = []
+    all_ids = resting_ladder_ids(monkeypatch)
+
+    real_log_tick = journal.log_tick
+
+    def flaky(record, log_dir=None):
+        # Only the fill-lookup record fails: a log_tick that raised for
+        # everything would take out the loop's own error handler too and prove
+        # nothing about this guard.
+        if "ladder fill lookup failed" in str(record.get("error", "")):
+            raise OSError("[Errno 13] journal is locked")
+        return real_log_tick(record, log_dir)
+
+    api = UnqueryableLoopClient(
+        price="2500.00", balance="1000.0",
+        open_orders_after_tick={2: [i for i in all_ids if i != all_ids[0]]},
+    )
+    monkeypatch.setattr(journal, "log_tick", flaky)
+    records = run_loop(monkeypatch, written, ticks=3, api=api, orders=order_journal)
+
+    # The lookup failed AND saying so failed, and the ladder still settled and
+    # reconciled: tick 2 armed the wait, tick 3 found it stable and refilled the
+    # missing rung.
+    assert api.orders == len(all_ids) + 1
+    assert order_journal == []
+    # And the loop never fell through to its outer handler over it.
+    assert "error" not in actions(records)
+
+
 # --- the tick journal describes the live ladder ----------------------------
 
 

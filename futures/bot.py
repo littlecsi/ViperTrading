@@ -401,7 +401,9 @@ def _detect_fill(api, cfg, ladder_state) -> tuple:
     return tuple(tracked_ids - open_ids)
 
 
-def _journal_ladder_fill(api, cfg, decision, price, wallet, order_id, rung_price) -> bool:
+def _journal_ladder_fill(
+    api, cfg, decision, price, wallet, order_id, rung_price, pending=None
+) -> bool:
     """Journal and notify ONE rung that left the book, if it left by filling.
 
     Shared by the two places a departed rung can first be seen: the tick that
@@ -426,7 +428,19 @@ def _journal_ladder_fill(api, cfg, decision, price, wallet, order_id, rung_price
 
     A failed lookup is recorded as a tick `error` and stepped over rather than
     allowed to raise: losing one record is bad, losing the settling wait or the
-    reconciliation that puts the missing rung back is worse.
+    reconciliation that puts the missing rung back is worse. That record is
+    itself written under a nested guard - it opens a file, and a locked or full
+    one raising HERE would take out the very wait this path exists to protect.
+
+    `pending` splits the two halves for a caller that has book work in front of
+    it. The journal write is a local append and always happens immediately -
+    that is what makes a raise later in the same pass unable to lose the fill
+    record - but the Telegram push is an HTTP call worth up to
+    notify.TIMEOUT_SECONDS, and with a full ladder that is N of them. Given a
+    list, the record is appended to it instead of pushed, for _notify_ladder_fills
+    to send once the orders are away. The same split _notify_cancel_failure
+    makes, for the same reason: nothing that talks to the network gets in front
+    of an order.
 
     Returns whether the exchange ANSWERED - not whether a record was written.
     False means the order's state is still unknown and the other site should try
@@ -441,9 +455,17 @@ def _journal_ladder_fill(api, cfg, decision, price, wallet, order_id, rung_price
     try:
         result = execution.query_order_result(api, cfg.symbol, order_id)
     except Exception as exc:
-        journal.log_tick(
-            {"action": "error", "error": f"ladder fill lookup failed: {_ascii(exc)}"}
-        )
+        # Nested guard, exactly as the exit path's failed-cancel record uses:
+        # log_tick opens a file, and a locked file or a full disk raising here
+        # would escape before the detect site arms the settling wait - leaving a
+        # ladder that can never reconcile for as long as the failure lasts,
+        # under one throttled error message a minute.
+        try:
+            journal.log_tick(
+                {"action": "error", "error": f"ladder fill lookup failed: {_ascii(exc)}"}
+            )
+        except Exception:
+            pass
         return False
     if result.get("status") != "FILLED":
         return True  # cancelled by us or the exchange, not a fill
@@ -465,8 +487,29 @@ def _journal_ladder_fill(api, cfg, decision, price, wallet, order_id, rung_price
         "balance": wallet,
     }
     journal.log_order(record)
-    notify.order_executed(record)
+    if pending is None:
+        notify.order_executed(record)
+    else:
+        pending.append(record)
     return True
+
+
+def _notify_ladder_fills(records) -> None:
+    """Push the ladder fills a reconcile pass journalled - AFTER its book work.
+
+    The records were written the moment each fill was confirmed; this is only
+    the Telegram half, held back because the reconcile has cancels and
+    placements to send and up to one HTTP call per departed rung would sit in
+    front of them. A deep cascade is precisely when both numbers are largest:
+    every rung gone is a rung to notify AND a rung to replace, so the naive
+    order puts the whole ladder's worth of timeouts ahead of the rebuild, and
+    then delays the next tick's HALT check and liquidation backstop behind that
+    - with a leveraged position open and price moving.
+
+    Empty on nearly every pass, and it is the same rule _notify_cancel_failure
+    and the HALT notification already follow."""
+    for record in records:
+        notify.order_executed(record)
 
 
 def _log_ladder_fills(api, cfg, decision, price, wallet, ladder_state, filled_ids) -> None:
@@ -491,8 +534,17 @@ def _log_ladder_fills(api, cfg, decision, price, wallet, ladder_state, filled_id
     reconcile is not guaranteed to happen: every exit path (HALT, STOP_OUT, a
     dead-band SCALE_OUT, a zone change, a symbol change) goes through
     _cancel_ladder, which resets the state without reconciling. A rung that
-    fills on the tick before an adverse move - the exact move that triggers the
+    fills on the tick BEFORE an adverse move - the exact move that triggers the
     exit - would otherwise leave no record at all.
+
+    It does not close that hole, only the common half of it. A fill that first
+    becomes visible on the SAME poll as the exit is still lost: this branch is
+    not reached on such a tick (the exit is decided above it), _cancel_ladder
+    discards the rung->id map, and nothing ever asks the exchange what those ids
+    did. Closing it means snapshotting the tracked ids before the teardown and
+    querying them after the flatten has gone out, across every exit call site -
+    parked as a documented follow-up rather than done here, because that is the
+    flatten path and it may not grow a single pre-order round-trip.
 
     The lookup is one REST call per departed rung and it sits in front of the
     settling wait, which is why _journal_ladder_fill swallows its failures
@@ -619,11 +671,15 @@ def _reconcile_ladder(
     # where the most money moves, and it was leaving trades with no order-journal
     # line at all.
     #
-    # Ahead of the cancel/place work below rather than after it, unlike the
-    # brake notification. That rule exists so nothing that talks to Telegram
-    # delays an order this call is deciding to send; these fills happened before
-    # this call started, and holding them until after the book work would mean
-    # a raise in the middle of it lost them permanently.
+    # The JOURNAL write goes ahead of the cancel/place work below: these fills
+    # happened before this call started, and holding their records until after
+    # the book work would mean a raise in the middle of it lost them
+    # permanently. The TELEGRAM half does not - it is collected in `fills` and
+    # pushed once the orders are away, because "nothing that talks to Telegram
+    # gets in front of an order" applies to this function's own placements too,
+    # and a cascade deep enough to be worth notifying about is exactly the one
+    # with the most rungs to rebuild.
+    fills = []
     live_ids = {o["orderId"] for o in open_orders}
     for rung_price, order_id in list(ladder_state.orders.items()):
         if order_id not in live_ids:
@@ -634,7 +690,7 @@ def _reconcile_ladder(
             else:
                 _journal_ladder_fill(
                     api, cfg, decision, price, snapshot.wallet_balance,
-                    order_id, rung_price,
+                    order_id, rung_price, pending=fills,
                 )
             # Pruned either way, including after a failed lookup: the id is off
             # the book and cannot come back, and keeping it would hand
@@ -646,19 +702,29 @@ def _reconcile_ladder(
     # Cancel before placing: the rungs being replaced hold margin, and sending
     # their replacements first is how a reconcile runs into -2019 against its
     # own outgoing orders.
-    if plan.cancel:
-        execution.cancel_orders(api, cfg.symbol, list(plan.cancel))
-        for rung_price, order_id in list(ladder_state.orders.items()):
-            if order_id in plan.cancel:
-                del ladder_state.orders[rung_price]
+    try:
+        if plan.cancel:
+            execution.cancel_orders(api, cfg.symbol, list(plan.cancel))
+            for rung_price, order_id in list(ladder_state.orders.items()):
+                if order_id in plan.cancel:
+                    del ladder_state.orders[rung_price]
 
-    for order in plan.place:
-        qty = execution.quantity_for(order.size, order.price, filters)
-        if not execution.is_executable(qty, order.price, filters):
-            continue
-        rounded_price = execution.price_for(order.price, filters, order.side)
-        result = execution.place_limit_order(api, cfg.symbol, order.side, qty, rounded_price)
-        ladder_state.orders[rounded_price] = result["orderId"]
+        for order in plan.place:
+            qty = execution.quantity_for(order.size, order.price, filters)
+            if not execution.is_executable(qty, order.price, filters):
+                continue
+            rounded_price = execution.price_for(order.price, filters, order.side)
+            result = execution.place_limit_order(api, cfg.symbol, order.side, qty, rounded_price)
+            ladder_state.orders[rounded_price] = result["orderId"]
+    finally:
+        # The deferred pushes, once the orders are away. A finally rather than a
+        # plain line after, matching the exit path's own deferred push: if a
+        # cancel or a placement raises it goes to the loop handler, which
+        # reports THAT and would never mention the fills - and a fill that
+        # already happened is still worth saying out loud even when the rebuild
+        # around it failed. _notify_ladder_fills cannot raise into the finally
+        # (notify swallows everything), so it cannot mask the original error.
+        _notify_ladder_fills(fills)
 
     # After the book work, never before it: the notification half of this is an
     # HTTP call worth up to notify.TIMEOUT_SECONDS, and nothing that talks to
