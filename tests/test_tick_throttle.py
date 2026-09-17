@@ -615,6 +615,77 @@ def test_the_placement_cap_reads_the_real_position_not_an_assumed_flat_one(
     assert sides.count("SELL") > 0
 
 
+class TieredLoopClient(LoopClient):
+    """A live 1.0 ETH long at 2500 - 2500 USDT of notional already carried -
+    against a bracket table whose maintenance rate steps up at 5000 USDT.
+
+    The planned accumulate side for this zone at this price is 3987.50, so
+    neither half crosses the step on its own; the two TOGETHER do, at 6487.50.
+    Tier 2's rate here is deliberately extreme so the difference is visible as
+    rungs rather than as arithmetic."""
+
+    maint_margin_ratio_2 = 0.5
+
+    def get_position_risk(self, symbol=None):
+        return [{
+            "symbol": symbol or "ETHUSDT", "positionAmt": "1.0",
+            "unRealizedProfit": "0.0", "liquidationPrice": "0.0",
+            "entryPrice": "2500.00", "isolatedWallet": "2000.00",
+        }]
+
+    def leverage_brackets(self, symbol):
+        return [{"symbol": symbol, "brackets": [
+            {"bracket": 1, "initialLeverage": 20, "notionalCap": 5000.0,
+             "notionalFloor": 0.0, "maintMarginRatio": 0.01, "cum": 0.0},
+            {"bracket": 2, "initialLeverage": 10, "notionalCap": 50000.0,
+             "notionalFloor": 5000.0,
+             "maintMarginRatio": self.maint_margin_ratio_2,
+             # Binance's maintenance amount is the constant that makes the
+             # piecewise requirement continuous at the step:
+             # floor * (this rate - the previous one). Derived rather than
+             # hard-coded so the control table below stays consistent when its
+             # rate changes, which is what keeps the RATE the only variable.
+             "cum": 5000.0 * (self.maint_margin_ratio_2 - 0.01)},
+        ]}]
+
+
+class FlatTierLoopClient(TieredLoopClient):
+    """The same account and the same plan, with tier 2 charging tier 1's rate.
+    The control: any difference from it is the tier choice and nothing else."""
+
+    maint_margin_ratio_2 = 0.01
+
+
+def test_the_liquidation_cap_picks_its_tier_from_the_total_notional(
+    monkeypatch, written
+):
+    """The maintenance tier is chosen on what the account would be CARRYING if
+    the plan filled - the open position plus the planned accumulation - not on
+    either half by itself.
+
+    Binance's rates only ever rise with notional, so understating the notional
+    selects a lower rate, and a lower rate puts the projected liquidation price
+    further from the adverse side than it really is. For a guard that decides
+    how much more to accumulate, that error is the wrong way round: it reports
+    an unsafe plan as safe. Here the position alone (2500) and the plan alone
+    (3987.50) each sit inside the first bracket while their sum (6487.50) does
+    not, so reading either half alone misses the step entirely and the
+    accumulate side goes out in full."""
+    control = FlatTierLoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, [], ticks=1, api=control)
+    control_sides = [o["side"] for o in control.placed_orders]
+    assert control_sides.count("BUY") > 0  # the plan is fine at tier 1's rate
+
+    api = TieredLoopClient(price="2500.00", balance="1000.0")
+    records = run_loop(monkeypatch, written, ticks=1, api=api)
+
+    assert "error" not in actions(records)
+    sides = [o["side"] for o in api.placed_orders]
+    assert sides.count("BUY") == 0  # and not at the rate it would really pay
+    # Same ladder, same cap, same everything else: only the tier moved.
+    assert sides.count("SELL") == control_sides.count("SELL")
+
+
 def test_the_backstops_cancellation_is_not_undone_by_the_next_placement(
     monkeypatch, written
 ):
@@ -667,6 +738,51 @@ def test_a_fully_blocked_placement_does_not_flood_the_tick_journal(monkeypatch, 
     ladder_ticks = [r for r in records if r.get("reason") == strategy.SCALE_OUT]
     assert len(ladder_ticks) == 5  # 300 polls at 1s, not 300 records
     assert api.orders == 0  # and nothing went to the exchange either
+
+
+class RecoveringLoopClient(LoopClient):
+    """Blocked for two ticks, then the operator tops up the isolated margin and
+    the reported liquidation price comes back to safety. Position, price and
+    wallet never move, so the DECISION is identical on every tick - which is
+    what makes the third tick's journal record a test of forcing rather than of
+    the key having changed."""
+
+    def get_position_risk(self, symbol=None):
+        safe = self._tick > 2
+        return [{
+            "symbol": symbol or "ETHUSDT", "positionAmt": "1.8",
+            "unRealizedProfit": "0.0",
+            "liquidationPrice": "0.0" if safe else "2435.00",
+            "entryPrice": "2800.00",
+            "isolatedWallet": "7000.00" if safe else "700.00",
+        }]
+
+
+def test_the_placement_that_finally_succeeds_is_written_immediately(monkeypatch, written):
+    """The other side of not forcing on a blocked attempt: the tick where the
+    block LIFTS puts a full ladder on the book, and that must be written then
+    and there.
+
+    Keying the write policy off `blocked` cannot do it - the flag describes the
+    PREVIOUS attempt, so the tick that actually places is judged 'not acting'.
+    Ladder placements never reach the order journal either, so that tick's
+    record is not merely late, it is lost: the state has been unchanged for
+    long enough that the next interval write is a minute of identical records
+    away and says nothing about when the ladder went on. The signal has to be
+    whether THIS call placed anything."""
+    api = RecoveringLoopClient(
+        price="2600.00", balance="1000.0",
+        position="1.8", entry_price="2800.00", isolated_wallet="700.00",
+        liquidation_price="2435.00",
+    )
+    records = run_loop(monkeypatch, written, ticks=3, api=api)
+
+    assert "error" not in actions(records)
+    assert api.orders > 0  # the block really did lift
+    ladder_ticks = [r for r in records if r.get("reason") == strategy.SCALE_OUT]
+    # Tick 1 (blocked, but the first record is always written) and tick 3 (the
+    # placement). Tick 2 is a blocked repeat and stays throttled.
+    assert len(ladder_ticks) == 2
 
 
 def test_a_fully_rejected_ladder_still_retries_next_tick(monkeypatch, written):
@@ -842,13 +958,20 @@ class BreachedLoopClient(LoopClient):
 
     Breaching from the START would be a different test - the placement paths
     refuse the accumulate side outright while the reported price is breached, so
-    there would be no BUY rungs on the book for the backstop to take off."""
+    there would be no BUY rungs on the book for the backstop to take off.
+
+    `breach_after_tick` is the last tick still reported as safe, so a test that
+    needs a fill and the settling wait it starts to complete BEFORE the brake
+    engages can push the breach further out."""
+
+    breach_after_tick = 1
 
     def get_position_risk(self, symbol=None):
+        breached = self._tick > self.breach_after_tick
         return [{
             "symbol": symbol or "ETHUSDT", "positionAmt": "1.0",
             "unRealizedProfit": "0.0",
-            "liquidationPrice": "2495.00" if self._tick > 1 else "2000.00",
+            "liquidationPrice": "2495.00" if breached else "2000.00",
             "entryPrice": "2500.00", "isolatedWallet": "500.00",
         }]
 
@@ -868,13 +991,70 @@ def test_liquidation_backstop_cancels_remaining_accumulate_rungs(monkeypatch, wr
     assert not set(sell_ids) & set(api.cancelled_order_ids)
     assert api.cancelled == []  # selective, so NOT cancel_open_orders
 
+    # And it left a trace. The Telegram push is the same event, formatted from
+    # this record and sent after it - but notifications are optional (an
+    # install with no token configured is a supported state), so the journal
+    # is the only place the backstop cancelling a whole accumulate side is
+    # guaranteed to be visible at all.
+    brakes = [r for r in records if r.get("action") == "liquidation_brake"]
+    assert len(brakes) == 1
+    assert brakes[0]["cancelled"] is True
+    assert brakes[0]["liquidation_price"] == 2495.0
+    assert brakes[0]["survival_price"] == pytest.approx(2271.50, abs=0.01)
+
 
 def test_liquidation_backstop_does_not_fire_while_the_position_is_safe(monkeypatch, written):
     """The default fixture reports no liquidation price and no position, which
     must read as 'nothing to guard', not as a breach."""
     api = LoopClient(price="2500.00", balance="1000.0")
-    run_loop(monkeypatch, written, ticks=5, api=api)
+    records = run_loop(monkeypatch, written, ticks=5, api=api)
     assert api.cancelled_order_ids == []
+    assert "liquidation_brake" not in actions(records)
+
+
+class LateBreachLoopClient(BreachedLoopClient):
+    """Safe for one tick longer, so a fill and the settling wait it starts both
+    complete before the reported price crosses the survival target."""
+
+    breach_after_tick = 2
+
+
+def test_a_filled_rung_is_forgotten_so_a_breach_does_not_brake_every_other_tick(
+    monkeypatch, written
+):
+    """A filled rung's id must stop being tracked at the first reconcile.
+
+    A fill is, to this bot, an id that stopped being reported as open - and it
+    stays that way forever. _reconcile_ladder used to drop a tracked id only
+    when the id appeared in its own cancel plan, and a FILLED id never can:
+    plan_orders only ever sees orders that are still resting. So the id
+    survived the reconcile, the next tick's _detect_fill found it missing
+    again, settling re-armed, the tick after that reconciled again - a two-tick
+    limit cycle for the life of the zone.
+
+    Harmless-looking while the position is safe, because a reconcile that
+    changes nothing sends nothing. Under a sustained breach it is not: the
+    accumulate side is refused on every pass, so every other tick engaged the
+    brake - measured at 9 reconciles in 20 ticks, each pushing an unthrottled
+    Telegram during exactly the emergency the loop most needs to stay
+    responsive for. Sticky states notify on the TRANSITION."""
+    control = LateBreachLoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, [], ticks=1, api=control)
+    all_ids = [o["orderId"] for o in control._open_orders]
+    buy_ids = [o["orderId"] for o in control._open_orders if o["side"] == "BUY"]
+    assert buy_ids  # the fill under test has to be a real accumulate rung
+
+    api = LateBreachLoopClient(
+        price="2500.00", balance="1000.0",
+        # Tick 1 places the ladder while the position is still safe; tick 2
+        # sees a rung gone and starts settling; tick 3 finds the set unchanged
+        # and reconciles - by which time the breach has begun.
+        open_orders_after_tick={2: [i for i in all_ids if i != buy_ids[0]]},
+    )
+    records = run_loop(monkeypatch, written, ticks=20, api=api)
+
+    assert "error" not in actions(records)
+    assert actions(records).get("liquidation_brake") == 1
 
 
 # --- the ladder comes off the book when its zone is left -------------------

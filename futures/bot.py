@@ -181,10 +181,48 @@ def _liquidation_breached(trend, liquidation_price, survival_price) -> bool:
     return liquidation_price <= survival_price
 
 
+def _log_liquidation_brake(cfg, survival, liquidation_price, scale, source) -> None:
+    """Record the brake engaging, then push the SAME record to Telegram.
+
+    Journal first and notify from what was written - the rule every other
+    pushed event follows (startup_refused, config_refused). A Telegram problem
+    must never cost the audit line, and the message can never disagree with it.
+    Without the record, an install with no token configured - a supported
+    state, not a misconfiguration - has the guard cancelling a whole
+    accumulate side and leaving no trace anywhere at all.
+
+    `source` distinguishes the two guards: the reconcile pass sizing the
+    remaining accumulate side down from its projection, and the backstop
+    pulling it off the book on the exchange's own reported figure.
+
+    Unthrottled, and it does not need a throttle: both call sites already fire
+    only on a transition. The backstop's cancel list is empty on every tick
+    after the one that emptied it, and a reconcile runs only where a settling
+    wait ended."""
+    record = {
+        "action": "liquidation_brake",
+        "reason": source,
+        "symbol": cfg.symbol,
+        "trend": cfg.trend,
+        "leverage": cfg.leverage,
+        "survival_price": survival,
+        "liquidation_price": liquidation_price,
+        "scale": scale,
+        "cancelled": scale == 0.0,
+    }
+    journal.log_tick(record)
+    # notify.liquidation_brake takes the message's values as keywords rather
+    # than a record, so the two journal-bookkeeping fields are dropped here -
+    # the rest is passed through exactly as written.
+    notify.liquidation_brake(
+        **{k: v for k, v in record.items() if k not in ("action", "reason")}
+    )
+
+
 def _place_ladder(
     api, cfg, zone_index, price, snapshot, max_n, filters, leverage_brackets,
     ladder_state
-) -> None:
+) -> bool:
     """Compute the full desired order set for the active zone against current
     price and the CURRENT position, and place every valid rung.
 
@@ -218,7 +256,13 @@ def _place_ladder(
 
     A rung whose floored quantity cannot clear the exchange filters is skipped
     rather than retried: a rung's notional is fixed by the zone geometry, so one
-    too small now is too small every tick."""
+    too small now is too small every tick.
+
+    Returns whether this call actually put anything on the book. That is the
+    only honest signal for "this tick acted": an attempt the cap blocks in full
+    sends nothing and is repeated every poll, while the tick where the block
+    lifts is the one that matters and has no other record anywhere - ladder
+    placements do not reach the order journal. See run()'s `acting`."""
     zone = cfg.zones[zone_index]
     desired = ladder.desired_orders(
         zone, cfg.trend, max_n, cfg.alpha, cfg.rung_spacing_pct, price
@@ -239,7 +283,16 @@ def _place_ladder(
         survival = ladder.survival_price(
             cfg.zones, zone_index, cfg.trend, cfg.liquidation_buffer_pct
         )
-        tier = market.maintenance_tier_from(leverage_brackets, planned_notional)
+        # The tier is chosen on the notional the account would be CARRYING if
+        # the plan filled - what is open now plus what is planned - not on
+        # either half alone. Binance's maintenance rate only rises with
+        # notional, so understating it picks a lower rate, and a lower rate
+        # projects the liquidation price further from the adverse side than it
+        # really is. That is the wrong direction for a safety guard: it makes
+        # an unsafe plan read as safe.
+        tier = market.maintenance_tier_from(
+            leverage_brackets, abs(snapshot.position_amt) * price + planned_notional
+        )
         if _liquidation_breached(cfg.trend, snapshot.liquidation_price, survival):
             # Whatever the projection would say, the exchange reports this
             # position as already past the level it has to survive to. Without
@@ -265,6 +318,7 @@ def _place_ladder(
             desired = ladder.apply_liquidation_cap(desired, scale, cfg.trend)
 
     valid, _deferred = ladder.validate_orders(desired, price, cfg.trend, filters)
+    placed = 0
     for order in valid:
         qty = execution.quantity_for(order.size, order.price, filters)
         if not execution.is_executable(qty, order.price, filters):
@@ -272,11 +326,13 @@ def _place_ladder(
         rounded_price = execution.price_for(order.price, filters, order.side)
         result = execution.place_limit_order(api, cfg.symbol, order.side, qty, rounded_price)
         ladder_state.orders[rounded_price] = result["orderId"]
+        placed += 1
 
     # Recorded AFTER the loop, so a placement that raised partway leaves the
     # flag alone: some rungs are live, the tracked set is non-empty, and the
     # next tick will not attempt a placement at all.
     ladder_state.blocked = not ladder_state.orders
+    return placed > 0
 
 
 def _cancel_ladder(api, cfg, ladder_state) -> None:
@@ -368,10 +424,17 @@ def _reconcile_ladder(
     survival = ladder.survival_price(
         cfg.zones, decision.zone_index, cfg.trend, cfg.liquidation_buffer_pct
     )
-    tier = market.maintenance_tier_from(leverage_brackets, position_qty * price)
 
     accumulate_side = "BUY" if cfg.trend == settings.LONG else "SELL"
     planned_delta_notional = sum(o.size for o in desired if o.side == accumulate_side)
+    # On the notional the account would be CARRYING if the plan filled, as in
+    # _place_ladder: the open position plus the planned accumulation. Either
+    # half alone understates it, understating it selects a lower maintenance
+    # rate, and a lower rate projects the liquidation price further from the
+    # adverse side than it really is - a safety guard erring toward "safe".
+    tier = market.maintenance_tier_from(
+        leverage_brackets, position_qty * price + planned_delta_notional
+    )
     # As in _place_ladder: the planned quantity is the accumulate-side notional
     # over CURRENT price rather than a per-rung sum over each rung's own price.
     # That understates quantity, which overstates the average entry, which
@@ -407,6 +470,24 @@ def _reconcile_ladder(
 
     valid, _deferred = ladder.validate_orders(capped, price, cfg.trend, filters)
     open_orders = market.get_open_orders(api, cfg.symbol)
+
+    # Forget every tracked id the exchange no longer reports as open, BEFORE
+    # the plan is applied. Whether it filled or was cancelled out from under
+    # the bot makes no difference: it is off the book and can never come back.
+    # Pruning on the cancel plan alone cannot do this - plan_orders only ever
+    # sees orders that ARE resting, so a filled id is by definition absent from
+    # it, and it stayed tracked forever. That made _detect_fill report the same
+    # fill on every later tick: settle, reconcile, settle, reconcile, two ticks
+    # per cycle for the life of the zone. Invisible while nothing changes,
+    # because a reconcile that matches everything sends nothing - but under a
+    # sustained liquidation breach every one of those passes refuses the
+    # accumulate side afresh and engages the brake, so the transition-only
+    # notification became one per two polls during the emergency.
+    live_ids = {o["orderId"] for o in open_orders}
+    for rung_price, order_id in list(ladder_state.orders.items()):
+        if order_id not in live_ids:
+            del ladder_state.orders[rung_price]
+
     plan = ladder.plan_orders(valid, open_orders, filters)
 
     # Cancel before placing: the rungs being replaced hold margin, and sending
@@ -426,14 +507,12 @@ def _reconcile_ladder(
         result = execution.place_limit_order(api, cfg.symbol, order.side, qty, rounded_price)
         ladder_state.orders[rounded_price] = result["orderId"]
 
-    # After the book work, never before it: this is an HTTP call worth up to
-    # notify.TIMEOUT_SECONDS and nothing that talks to Telegram gets in front
-    # of an order. notify cannot raise.
+    # After the book work, never before it: the notification half of this is an
+    # HTTP call worth up to notify.TIMEOUT_SECONDS, and nothing that talks to
+    # Telegram gets in front of an order. Neither half can raise.
     if scale < 1.0:
-        notify.liquidation_brake(
-            symbol=cfg.symbol, trend=cfg.trend, leverage=cfg.leverage,
-            survival_price=survival, liquidation_price=snapshot.liquidation_price,
-            scale=scale, cancelled=(scale == 0.0),
+        _log_liquidation_brake(
+            cfg, survival, snapshot.liquidation_price, scale, "reconcile"
         )
 
     # The wait is over whether or not the diff had anything in it. Leaving the
@@ -763,40 +842,39 @@ def run() -> None:
             # nothing and leaves the tracked set empty, so the next tick reads
             # the same "no ladder yet" condition and attempts again, forever,
             # while the position stays unsafe. Attempting is not acting, and
-            # forcing on it floods exactly as a resting ladder used to. The
-            # cost is that the tick which eventually DOES place, once the
-            # position recovers, is not forced either - it is still written,
-            # but by the interval rather than immediately, so up to
-            # TICK_LOG_INTERVAL_SECONDS late. A bounded delay on one record
-            # beats a record per poll for as long as the block lasts.
+            # forcing on it floods exactly as a resting ladder used to.
+            #
+            # It is a prediction, though - the flag describes the PREVIOUS
+            # attempt - so it cannot be the last word. The tick where the block
+            # lifts is judged not-acting by it and is the one tick here that
+            # most needs recording, so the write is revisited below against
+            # what the placement actually did.
             acting = (
                 placing_ladder and not ladder_state.blocked
                 if in_zone_ladder_case
                 else sending
             )
 
-            tick_log.log(
-                {
-                    "symbol": cfg.symbol,
-                    "mark_price": price,
-                    "trend": cfg.trend,
-                    "leverage": cfg.leverage,
-                    "active_zone_index": decision.zone_index,
-                    "support": zone.support if zone else None,
-                    "resistance": zone.resistance if zone else None,
-                    "d": decision.d,
-                    "max_notional": decision.max_n,
-                    "target_notional": decision.target_signed,
-                    "current_notional": position_notional,
-                    "delta": decision.delta,
-                    "action": decision.action,
-                    "reason": decision.reason,
-                    "balance": wallet,
-                    "unrealized_pnl": pnl,
-                },
-                key=(decision.action, decision.reason),
-                forced=acting,
-            )
+            tick_record = {
+                "symbol": cfg.symbol,
+                "mark_price": price,
+                "trend": cfg.trend,
+                "leverage": cfg.leverage,
+                "active_zone_index": decision.zone_index,
+                "support": zone.support if zone else None,
+                "resistance": zone.resistance if zone else None,
+                "d": decision.d,
+                "max_notional": decision.max_n,
+                "target_notional": decision.target_signed,
+                "current_notional": position_notional,
+                "delta": decision.delta,
+                "action": decision.action,
+                "reason": decision.reason,
+                "balance": wallet,
+                "unrealized_pnl": pnl,
+            }
+            tick_key = (decision.action, decision.reason)
+            wrote_tick = tick_log.log(tick_record, key=tick_key, forced=acting)
 
             if decision.action in (strategy.HOLD, strategy.IDLE):
                 # A HOLD is normally "the ladder is resting and the position is
@@ -890,6 +968,7 @@ def run() -> None:
                 }
 
             if in_zone_ladder_case:
+                placed = False
                 if placing_ladder:
                     # The old zone's rungs come off the book before the new
                     # zone's go on - and deliberately OUTSIDE the try/finally
@@ -905,7 +984,7 @@ def run() -> None:
                 try:
                     if placing_ladder:
                         ladder_state.reset()
-                        _place_ladder(
+                        placed = _place_ladder(
                             api, cfg, decision.zone_index, price, snapshot,
                             decision.max_n, filters, leverage_brackets,
                             ladder_state,
@@ -975,6 +1054,22 @@ def run() -> None:
                     # NOT retry-safe to skip, which is why it sits outside.
                     active_index = decision.zone_index
 
+                # What the placement actually did, which `acting` above could
+                # only guess at. A ladder going on the book is the one event
+                # this branch produces and it reaches no other log - ladder
+                # placements are not orders as far as journal.log_order is
+                # concerned - so a tick that placed and was throttled has no
+                # record of the placement anywhere, not a late one. That is the
+                # case where the tracked set was empty because the liquidation
+                # cap had blocked every previous attempt: `blocked` describes
+                # the attempt BEFORE this one, so the tick where the block
+                # lifts is judged not-acting by it and the state it repeats is
+                # a minute old. Written here instead, and only where the write
+                # above was skipped, so the ordinary placement tick - already
+                # forced - does not get a second identical line.
+                if placed and not wrote_tick:
+                    tick_log.log(tick_record, key=tick_key, forced=True)
+
                 # The backstop, run on every in-zone tick whichever branch above
                 # was taken and whether or not the ladder is settling - the one
                 # guard that does not wait for the market to stop moving. (A
@@ -1025,11 +1120,9 @@ def run() -> None:
                             for rung_price, order_id in list(ladder_state.orders.items()):
                                 if order_id in to_cancel:
                                     del ladder_state.orders[rung_price]
-                            notify.liquidation_brake(
-                                symbol=cfg.symbol, trend=cfg.trend,
-                                leverage=cfg.leverage, survival_price=survival,
-                                liquidation_price=snapshot.liquidation_price,
-                                scale=0.0, cancelled=True,
+                            _log_liquidation_brake(
+                                cfg, survival, snapshot.liquidation_price,
+                                0.0, "backstop",
                             )
 
                 _sleep(cfg.poll_seconds)
