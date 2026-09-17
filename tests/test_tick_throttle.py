@@ -215,11 +215,13 @@ def test_config_reloaded_record_is_written_unthrottled(written):
 class LoopClient:
     """Enough of UMFutures for one trip round bot.run()."""
 
-    def __init__(self, price="2700.00", balance="0.0", order_error=None):
+    def __init__(self, price="2700.00", balance="0.0", order_error=None, margin_type_error=None):
         self.price = price
         self._balance = balance
         self.order_error = order_error
+        self.margin_type_error = margin_type_error
         self.orders = 0
+        self.margin_type_calls = []
 
     def exchange_info(self):
         return {
@@ -251,6 +253,11 @@ class LoopClient:
         if self.order_error is not None:
             raise RuntimeError(self.order_error(self.orders))
         return {"orderId": self.orders, "avgPrice": "0", "executedQty": "0", "cumQuote": "0"}
+
+    def change_margin_type(self, symbol, marginType):
+        self.margin_type_calls.append((symbol, marginType))
+        if self.margin_type_error is not None:
+            raise self.margin_type_error
 
 
 def run_loop(monkeypatch, written, ticks, api=None, load=None):
@@ -336,3 +343,33 @@ def test_a_different_error_is_written_immediately(monkeypatch, written):
         "-2019 Margin is insufficient",  # 60s later
         "-1021 Timestamp",  # the tick it changed, not 60s after
     ]
+
+
+# --- ISOLATED margin at startup --------------------------------------------
+
+
+def test_startup_sets_isolated_margin(monkeypatch, written):
+    api = LoopClient()
+    run_loop(monkeypatch, written, ticks=1, api=api)
+    assert api.margin_type_calls == [("ETHUSDT", "ISOLATED")]
+
+
+def test_startup_tolerates_already_isolated(monkeypatch, written):
+    from binance.error import ClientError
+
+    api = LoopClient(margin_type_error=ClientError(400, -4046, "No need to change margin type.", {}))
+    # Must not raise / must not prevent the loop from running.
+    run_loop(monkeypatch, written, ticks=1, api=api)
+
+
+def test_startup_warns_but_continues_when_position_open(monkeypatch, written, capsys):
+    from binance.error import ClientError
+
+    api = LoopClient(
+        margin_type_error=ClientError(
+            400, -4047, "Margin type cannot be changed if there exists position.", {}
+        )
+    )
+    run_loop(monkeypatch, written, ticks=1, api=api)
+    output = capsys.readouterr().out
+    assert "ISOLATED" in output.upper()

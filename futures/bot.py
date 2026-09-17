@@ -150,6 +150,15 @@ def run() -> None:
     api = client.build(cfg.testnet)
 
     market.set_leverage(api, cfg.symbol, cfg.leverage)
+    margin_result = market.set_margin_type(api, cfg.symbol)
+    if margin_result == "position_open":
+        print(
+            f"WARNING: could not switch {cfg.symbol} to ISOLATED margin - "
+            "a position is already open in CROSSED mode. Continuing in "
+            "CROSSED mode; the liquidation-cap projection assumes ISOLATED "
+            "and will be wrong until this position clears and the switch "
+            "can retry."
+        )
     filters = market.get_filters(api, cfg.symbol)
 
     label = "TESTNET" if cfg.testnet else "LIVE"
@@ -278,6 +287,13 @@ def run() -> None:
                             # symbol while sizing orders off the new symbol's lot step.
                             new_filters = market.get_filters(api, new_cfg.symbol)
                             market.set_leverage(api, new_cfg.symbol, new_cfg.leverage)
+                            margin_result = market.set_margin_type(api, new_cfg.symbol)
+                            if margin_result == "position_open":
+                                print(
+                                    f"WARNING: could not switch {new_cfg.symbol} to "
+                                    "ISOLATED margin - a position is already open in "
+                                    "CROSSED mode."
+                                )
                             filters = new_filters
                             # Zone state belongs to the old symbol's ladder and
                             # means nothing on the new one.
