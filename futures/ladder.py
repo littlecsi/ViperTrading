@@ -146,16 +146,23 @@ def liquidation_scale(
     Uses Binance's documented isolated-margin liquidation formula (single
     position, one-way mode); adding delta_qty at price p is modelled as also
     adding delta_qty*p/leverage of fresh isolated margin, matching how
-    Binance funds an added fill at a fixed leverage. Safety is evaluated at
-    the two endpoints k=0 and k=1 FIRST rather than solving and clamping:
-    the liquidation price is a ratio in k whose pole can sit outside [0, 1],
-    which would put the raw algebraic root on the wrong side of the
-    interval. Only in the sub-case where the endpoints disagree is the
-    closed-form crossing point used, and there the intermediate value
-    theorem guarantees it lands inside (0, 1). k=1 means the full planned
-    accumulation is safe as-is; k=0 means even the smallest further
-    accumulation is unsafe. See the design doc's "Liquidation-aware buy-side
-    cap"."""
+    Binance funds an added fill at a fixed leverage.
+
+    Safety is evaluated at the two endpoints k=0 and k=1 FIRST, rather than
+    solving the closed form and clamping the root into range. Because the
+    denominator qty*(1 -/+ mmr) is positive, "liquidation price stays the
+    right side of survival_price" is equivalent to the linear test
+    (a - c*position_qty) + (b - c*planned_delta_qty) * k <= 0. The SIGN of
+    that slope (b - c*planned_delta_qty) is not fixed by the inputs, so the
+    safe region is sometimes [0, k*] and sometimes [k*, 1] -- knowing the
+    root k* tells you nothing on its own about which side of it is safe, and
+    a root outside [0, 1] can mean either "everything here is safe" or
+    "nothing here is". Checking the endpoints resolves that first: if they
+    disagree the root is the crossing between a known-safe and a known-unsafe
+    end, which is the only case where solving is meaningful. k=1 means the
+    full planned accumulation is safe as-is; k=0 means even the smallest
+    further accumulation is unsafe. See the design doc's "Liquidation-aware
+    buy-side cap"."""
     mmr = tier.maint_margin_rate
     maint_amount = tier.maint_amount
 
@@ -186,9 +193,12 @@ def liquidation_scale(
     if not safe(liquidation_price(0.0)):
         return 0.0
 
-    # Safety is monotonic and continuous between k=0 (safe) and k=1 (unsafe)
-    # -- no pole in this range since qty stays positive throughout -- so the
-    # closed-form crossing point is guaranteed to land in (0, 1).
+    # k=1 is unsafe and k=0 reads as safe, so solve for the crossing point.
+    # For position_qty > 0 that crossing is genuinely inside (0, 1). For a
+    # flat position it may not be: the k=0 end is only safe via the
+    # zero-position sentinel above, not on the real curve, so the real curve
+    # can fail to cross at all within [0, 1] -- which is why the root is
+    # range-checked rather than clamped below.
     if trend == LONG:
         a = entry_price * position_qty - isolated_wallet + maint_amount
         b = planned_delta_notional * (1 - 1 / leverage)
@@ -206,7 +216,16 @@ def liquidation_scale(
         # position_qty == 0 put a discontinuity at k=0 (flat is trivially
         # safe, nothing above it is). Nothing beyond zero is safe there.
         return 0.0
-    return max(0.0, min(1.0, (c * position_qty - a) / denominator))
+
+    # Range-check, never clamp. Clamping a root above 1 up to 1.0 would
+    # report "the whole plan is safe" for a plan whose k=1 endpoint was just
+    # measured unsafe. Reaching here always means the real k=1 is unsafe, so
+    # a root outside [0, 1] means the curve never crosses survival_price
+    # inside the interval and the unsafe sign holds across all of it: cap the
+    # accumulate side to nothing. (A NaN root fails this test too, and lands
+    # on the same conservative answer.)
+    k = (c * position_qty - a) / denominator
+    return k if 0.0 <= k <= 1.0 else 0.0
 
 
 def survival_price(

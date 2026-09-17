@@ -164,12 +164,15 @@ def test_liquidation_scale_result_actually_meets_the_survival_price():
 
 def test_liquidation_scale_short_mirrors_long():
     # Survival above current price for a short; same shape of answer.
+    # Hand-derived: liq(k) = (1290 + 2310k) / (1.05 * (10 + 20k)), so
+    # liq(0) = 122.857 (safe) and liq(1) = 114.286 (unsafe), and the root is
+    # (126*10 - 1290) / (2310 - 126*20) = -30/-210 = 1/7.
     k = ladder.liquidation_scale(
         position_qty=10, entry_price=100, isolated_wallet=300, leverage=20,
         tier=TIER, survival_price=120, planned_delta_qty=20,
         planned_delta_notional=2200, trend=SHORT,
     )
-    assert 0.0 <= k <= 1.0
+    assert k == pytest.approx(1 / 7, rel=1e-6)
 
 
 def test_survival_price_uses_next_lower_zone_for_long():
@@ -253,3 +256,52 @@ def test_liquidation_scale_flat_position_with_leftover_margin_finds_the_root():
     cost_basis = k * 1800
     liq_price = (cost_basis - wallet + TIER.maint_amount) / (qty * (1 - TIER.maint_margin_rate))
     assert liq_price == pytest.approx(85.0)
+
+
+def test_liquidation_scale_flat_position_never_reports_an_unsafe_plan_as_safe():
+    # Flat position, survival just below LiqPrice(1) = 1720/19 = 90.5263. The
+    # k=0 endpoint is only "safe" via the zero-position sentinel, so the real
+    # curve never crosses survival inside [0, 1]: the closed-form root lands
+    # at 10.53, outside the interval. Clamping that to 1.0 would report a
+    # plan as fully safe that the k=1 check just rejected.
+    k = ladder.liquidation_scale(
+        position_qty=0, entry_price=100, isolated_wallet=0, leverage=20,
+        tier=TIER, survival_price=90.05, planned_delta_qty=20,
+        planned_delta_notional=1800, trend=LONG,
+    )
+    assert k == 0.0
+
+
+def test_survival_price_uses_next_higher_zone_for_short():
+    zones = (
+        Zone(support=2625.00, resistance=3284.04),
+        Zone(support=2371.26, resistance=2625.00),
+        Zone(support=1872.46, resistance=2371.26),
+    )
+    # active zone is index 2; next-higher is index 1, span 253.74.
+    target = ladder.survival_price(zones, active_index=2, trend=SHORT, liquidation_buffer_pct=0.2)
+    next_zone = zones[1]
+    expected = next_zone.support + 0.2 * (next_zone.resistance - next_zone.support)
+    assert target == pytest.approx(expected)
+
+
+def test_survival_price_falls_back_to_own_span_at_the_highest_zone_for_short():
+    zones = (
+        Zone(support=2625.00, resistance=3284.04),
+        Zone(support=2371.26, resistance=2625.00),
+        Zone(support=1872.46, resistance=2371.26),
+    )
+    target = ladder.survival_price(zones, active_index=0, trend=SHORT, liquidation_buffer_pct=0.2)
+    edge = zones[0]
+    expected = edge.resistance + 0.2 * (edge.resistance - edge.support)
+    assert target == pytest.approx(expected)
+
+
+def test_apply_liquidation_cap_shrinks_only_the_sell_side_for_short():
+    orders = ladder.desired_orders(ZONE, SHORT, max_n=5000.0, alpha=2.0, rung_spacing_pct=0.005, current_price=2500.0)
+    capped = ladder.apply_liquidation_cap(orders, scale=0.5, trend=SHORT)
+    for original, adjusted in zip(orders, capped):
+        if original.side == "SELL":
+            assert adjusted.size == pytest.approx(original.size * 0.5)
+        else:
+            assert adjusted.size == original.size
