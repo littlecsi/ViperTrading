@@ -25,6 +25,8 @@ class Settings:
     stop_buffer: float
     poll_seconds: int
     testnet: bool
+    rung_spacing_pct: float
+    liquidation_buffer_pct: float
     zones: tuple[Zone, ...]
 
 
@@ -79,6 +81,14 @@ def load(path: str = SETTINGS_PATH) -> Settings:
     if not 0 <= stop_buffer < 1:
         raise ValueError("stop_buffer must be in [0, 1)")
 
+    rung_spacing_pct = float(data["rung_spacing_pct"])
+    if not 0 < rung_spacing_pct < 1:
+        raise ValueError("rung_spacing_pct must be in (0, 1)")
+
+    liquidation_buffer_pct = float(data["liquidation_buffer_pct"])
+    if not 0 <= liquidation_buffer_pct < 1:
+        raise ValueError("liquidation_buffer_pct must be in [0, 1)")
+
     poll_seconds = int(data["poll_seconds"])
     if poll_seconds < 1:
         raise ValueError("poll_seconds must be at least 1")
@@ -93,5 +103,7 @@ def load(path: str = SETTINGS_PATH) -> Settings:
         stop_buffer=stop_buffer,
         poll_seconds=poll_seconds,
         testnet=bool(data["testnet"]),
+        rung_spacing_pct=rung_spacing_pct,
+        liquidation_buffer_pct=liquidation_buffer_pct,
         zones=_parse_zones(data["zones"]),
     )

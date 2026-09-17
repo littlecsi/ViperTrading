@@ -20,6 +20,8 @@ def valid_data():
         "stop_buffer": 0.01,
         "poll_seconds": 5,
         "testnet": True,
+        "rung_spacing_pct": 0.005,
+        "liquidation_buffer_pct": 0.2,
         "zones": [
             {"support": 2625.00, "resistance": 3284.04},
             {"support": 2371.26, "resistance": 2625.00},
@@ -130,3 +132,40 @@ def test_accepts_zero_stop_buffer(tmp_path):
     data = valid_data()
     data["stop_buffer"] = 0
     assert settings.load(write(tmp_path, data)).stop_buffer == 0.0
+
+
+def test_rejects_zero_rung_spacing_pct(tmp_path):
+    data = valid_data()
+    data["rung_spacing_pct"] = 0
+    with pytest.raises(ValueError, match="rung_spacing_pct"):
+        settings.load(write(tmp_path, data))
+
+
+def test_rejects_rung_spacing_pct_at_or_above_one(tmp_path):
+    data = valid_data()
+    data["rung_spacing_pct"] = 1.0
+    with pytest.raises(ValueError, match="rung_spacing_pct"):
+        settings.load(write(tmp_path, data))
+
+
+def test_rejects_negative_liquidation_buffer_pct(tmp_path):
+    data = valid_data()
+    data["liquidation_buffer_pct"] = -0.01
+    with pytest.raises(ValueError, match="liquidation_buffer_pct"):
+        settings.load(write(tmp_path, data))
+
+
+def test_rejects_liquidation_buffer_pct_at_or_above_one(tmp_path):
+    data = valid_data()
+    data["liquidation_buffer_pct"] = 1.0
+    with pytest.raises(ValueError, match="liquidation_buffer_pct"):
+        settings.load(write(tmp_path, data))
+
+
+def test_loads_ladder_settings(tmp_path):
+    data = valid_data()
+    data["rung_spacing_pct"] = 0.005
+    data["liquidation_buffer_pct"] = 0.2
+    s = settings.load(write(tmp_path, data))
+    assert s.rung_spacing_pct == 0.005
+    assert s.liquidation_buffer_pct == 0.2
