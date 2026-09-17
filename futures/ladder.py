@@ -272,3 +272,77 @@ def apply_liquidation_cap(
         else o
         for o in orders
     )
+
+
+def validate_orders(
+    orders: tuple[DesiredOrder, ...],
+    current_price: float,
+    trend: str,
+    filters,  # market.Filters
+) -> tuple[tuple[DesiredOrder, ...], tuple[DesiredOrder, ...]]:
+    """Split desired orders into (valid, deferred).
+
+    An order is deferred rather than placed when it would cross the book --
+    e.g. a BUY priced above current market price -- which happens when price
+    moved between the settling check and this validation. It is dropped
+    entirely (neither valid nor deferred) when its notional cannot clear the
+    exchange minimum, since a liquidation-capped rung can shrink toward
+    zero: retrying a sub-minimum order forever is pointless. See design doc
+    "Lifecycle", step 4."""
+    valid, deferred = [], []
+    for order in orders:
+        if order.price * order.size == 0:
+            continue
+        notional = order.size
+        if notional < filters.min_notional:
+            continue
+        crosses = (
+            (order.side == "BUY" and order.price >= current_price)
+            or (order.side == "SELL" and order.price <= current_price)
+        )
+        if crosses:
+            deferred.append(order)
+        else:
+            valid.append(order)
+    return tuple(valid), tuple(deferred)
+
+
+@dataclass(frozen=True)
+class ReconciliationPlan:
+    cancel: tuple[int, ...]   # order ids to cancel
+    place: tuple[DesiredOrder, ...]
+
+
+def plan_orders(
+    desired: tuple[DesiredOrder, ...],
+    open_orders: list[dict],
+    price_tolerance: float = 0.0001,
+) -> ReconciliationPlan:
+    """Diff the desired order set against what is actually open, minimizing
+    churn: an open order matching a desired one (same side, price within
+    tolerance, and notional within that same tolerance) is left alone rather
+    than cancelled and replaced. Comparing notional as well as price and side
+    is what lets a rung whose size changed (e.g. a shifted liquidation cap)
+    get cancelled and replaced rather than mistaken for still current."""
+    remaining_desired = list(desired)
+    cancel = []
+
+    for open_order in open_orders:
+        open_price = float(open_order["price"])
+        open_side = open_order["side"]
+        open_notional = open_price * float(open_order["origQty"])
+        match = next(
+            (
+                d for d in remaining_desired
+                if d.side == open_side
+                and abs(d.price - open_price) <= price_tolerance * open_price
+                and abs(d.size - open_notional) <= price_tolerance * open_notional
+            ),
+            None,
+        )
+        if match is not None:
+            remaining_desired.remove(match)
+        else:
+            cancel.append(open_order["orderId"])
+
+    return ReconciliationPlan(cancel=tuple(cancel), place=tuple(remaining_desired))

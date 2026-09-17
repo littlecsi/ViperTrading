@@ -3,12 +3,13 @@ import math
 import pytest
 
 import ladder
-from market import MarginTier
+from market import Filters, MarginTier
 from settings import Zone, LONG, SHORT
 from strategy import distance, target_notional, signed
 
 ZONE = Zone(support=2371.26, resistance=2625.00)
 TIER = MarginTier(floor=0.0, cap=250000.0, maint_margin_rate=0.05, maint_amount=10.0)
+FILTERS = Filters(step_size=0.001, min_qty=0.001, min_notional=20.0)
 
 
 def test_rung_prices_span_support_to_resistance():
@@ -305,3 +306,64 @@ def test_apply_liquidation_cap_shrinks_only_the_sell_side_for_short():
             assert adjusted.size == pytest.approx(original.size * 0.5)
         else:
             assert adjusted.size == original.size
+
+
+def test_validate_orders_accepts_correctly_sided_orders():
+    orders = (
+        ladder.DesiredOrder(price=2400.0, side="BUY", size=100.0),
+        ladder.DesiredOrder(price=2500.0, side="SELL", size=50.0),
+    )
+    valid, deferred = ladder.validate_orders(orders, current_price=2450.0, trend=LONG, filters=FILTERS)
+    assert valid == orders
+    assert deferred == ()
+
+
+def test_validate_orders_defers_a_buy_priced_above_current():
+    # Simulates the race the design doc's "settling" step exists for: price
+    # moved between the stability check and validation.
+    orders = (ladder.DesiredOrder(price=2460.0, side="BUY", size=100.0),)
+    valid, deferred = ladder.validate_orders(orders, current_price=2450.0, trend=LONG, filters=FILTERS)
+    assert valid == ()
+    assert deferred == orders
+
+
+def test_validate_orders_defers_a_sell_priced_below_current():
+    orders = (ladder.DesiredOrder(price=2440.0, side="SELL", size=100.0),)
+    valid, deferred = ladder.validate_orders(orders, current_price=2450.0, trend=LONG, filters=FILTERS)
+    assert deferred == orders
+
+
+def test_validate_orders_drops_below_min_notional_as_neither_valid_nor_deferred():
+    # A rung shrunk near zero by the liquidation cap: not worth an order,
+    # and not worth retrying either.
+    orders = (ladder.DesiredOrder(price=2400.0, side="BUY", size=1.0),)  # 1.0 USDT notional
+    valid, deferred = ladder.validate_orders(orders, current_price=2450.0, trend=LONG, filters=FILTERS)
+    assert valid == ()
+    assert deferred == ()
+
+
+def test_plan_orders_places_missing_and_leaves_matching_alone():
+    desired = (
+        ladder.DesiredOrder(price=2400.0, side="BUY", size=100.0),
+        ladder.DesiredOrder(price=2500.0, side="SELL", size=50.0),
+    )
+    open_orders = [{"orderId": 1, "price": "2400.00", "side": "BUY", "origQty": "0.04167"}]
+    plan = ladder.plan_orders(desired, open_orders)
+    assert plan.cancel == ()
+    assert plan.place == (desired[1],)
+
+
+def test_plan_orders_cancels_stale_and_places_replacement():
+    desired = (ladder.DesiredOrder(price=2400.0, side="BUY", size=150.0),)  # size changed
+    open_orders = [{"orderId": 1, "price": "2400.00", "side": "BUY", "origQty": "0.04167"}]  # was 100.0 notional
+    plan = ladder.plan_orders(desired, open_orders, price_tolerance=0.0001)
+    assert plan.cancel == (1,)
+    assert plan.place == (desired[0],)
+
+
+def test_plan_orders_cancels_orders_no_longer_desired():
+    desired = ()
+    open_orders = [{"orderId": 1, "price": "2400.00", "side": "BUY", "origQty": "0.04167"}]
+    plan = ladder.plan_orders(desired, open_orders)
+    assert plan.cancel == (1,)
+    assert plan.place == ()
