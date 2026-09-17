@@ -1982,6 +1982,203 @@ git commit -m "feat: place a limit-order ladder on zone activation for in-zone s
 
 ---
 
+### Task 13b: `market.py`/`execution.py` — exchange price-tick rounding
+
+**Inserted during execution.** Task 13's review found that `ladder.rung_prices`
+computes raw floating-point prices with no exchange `tickSize` rounding
+anywhere in `futures/` — every resting limit order would be rejected with
+`-1111 Precision is over the maximum defined for this asset` against the
+real exchange. `market.Filters` carries only `step_size`/`min_qty`/
+`min_notional`; there is no price-tick handling. Fixing this at the source
+(inside `ladder.py`'s pure math) would mean threading a new parameter
+through five already-reviewed, approved functions (`rung_prices`,
+`rung_table`, `build_rung_orders`, `desired_orders`, `validate_orders`,
+`plan_orders`). Instead, this follows the exact precedent
+`execution.quantity_for` already set for *quantity*: round only at the
+execution boundary, where the theoretical price is about to become a real
+order — `ladder.py`'s rungs stay at their exact theoretical positions.
+
+**Files:**
+- Modify: `futures/market.py`
+- Modify: `futures/execution.py`
+- Modify: `tests/test_market.py`, `tests/test_execution.py`, `tests/test_ladder.py` (update the three existing `Filters(...)` test fixtures to include `tick_size`)
+
+**Interfaces:**
+- Modifies: `market.Filters` gains a required `tick_size: float` field.
+  `market.get_filters` extracts it from the `PRICE_FILTER` filter's
+  `tickSize` (the `tests/test_market.py` `FakeClient.exchange_info()`
+  fixture already includes this filter, unused until now — no fixture
+  change needed there).
+- Produces: `execution.price_for(price: float, filters: Filters) -> float`
+  — rounds a raw price to the nearest valid multiple of `filters.tick_size`
+  — consumed by `bot.py`'s `_place_ladder` (Task 13, retrofit) and Task
+  16's `_reconcile_ladder` (not yet dispatched — will be written to call
+  it from the start).
+
+- [ ] **Step 1: Write failing tests**
+
+```python
+# tests/test_market.py — add
+
+def test_get_filters_extracts_tick_size():
+    f = market.get_filters(FakeClient(), "ETHUSDT")
+    assert f.tick_size == 0.01
+
+
+def test_get_filters_raises_when_price_filter_missing():
+    with pytest.raises(ValueError, match="PRICE_FILTER"):
+        market.get_filters(MissingFilterClient("PRICE_FILTER"), "ETHUSDT")
+```
+
+```python
+# tests/test_execution.py — update the shared fixture
+
+F = Filters(step_size=0.001, min_qty=0.001, min_notional=20.0, tick_size=0.01)
+
+
+def test_price_for_rounds_down_to_the_nearest_tick():
+    # 2400.017 / 0.01 = 240001.7 -> floor 240001 -> 2400.01
+    assert execution.price_for(2400.017, F) == 2400.01
+
+
+def test_price_for_exact_multiple_is_unchanged():
+    assert execution.price_for(2400.05, F) == 2400.05
+
+
+def test_price_for_handles_floating_point_noise():
+    # 0.1 + 0.2 style noise must not round to an invalid tick.
+    price = 2400.00 + 0.01 * 3  # binary float noise around 2400.03
+    result = execution.price_for(price, F)
+    assert round(result / F.tick_size) == round(result / F.tick_size)  # exact multiple
+    assert result == 2400.03
+```
+
+```python
+# tests/test_ladder.py — update the shared fixture
+
+FILTERS = Filters(step_size=0.001, min_qty=0.001, min_notional=20.0, tick_size=0.01)
+```
+
+- [ ] **Step 2: Run tests, verify they fail**
+
+Run: `.viper/Scripts/python.exe -m pytest tests/test_market.py tests/test_execution.py tests/test_ladder.py -v`
+Expected: the new tests FAIL (`TypeError: Filters.__init__() missing... 'tick_size'` for the fixture-based ones, `AttributeError` for `market.Filters` and `execution.price_for`).
+
+- [ ] **Step 3: Implement**
+
+```python
+# futures/market.py — modify Filters
+
+@dataclass(frozen=True)
+class Filters:
+    step_size: float
+    min_qty: float
+    min_notional: float
+    tick_size: float
+```
+
+```python
+# futures/market.py — modify get_filters()
+
+def get_filters(client, symbol: str) -> Filters:
+    info = client.exchange_info()
+    entry = next(s for s in info["symbols"] if s["symbol"] == symbol)
+
+    step_size = min_qty = min_notional = tick_size = None
+    for f in entry["filters"]:
+        if f["filterType"] == "LOT_SIZE":
+            step_size = float(f["stepSize"])
+            min_qty = float(f["minQty"])
+        elif f["filterType"] == "MIN_NOTIONAL":
+            min_notional = float(f["notional"])
+        elif f["filterType"] == "PRICE_FILTER":
+            tick_size = float(f["tickSize"])
+
+    for name, value in (
+        ("LOT_SIZE", step_size),
+        ("LOT_SIZE", min_qty),
+        ("MIN_NOTIONAL", min_notional),
+        ("PRICE_FILTER", tick_size),
+    ):
+        if value is None or value <= 0:
+            raise ValueError(f"{symbol}: missing {name} filter")
+
+    return Filters(
+        step_size=step_size, min_qty=min_qty, min_notional=min_notional,
+        tick_size=tick_size,
+    )
+```
+
+```python
+# futures/execution.py — add near quantity_for()
+
+def price_for(price: float, filters: Filters) -> float:
+    """Limit-order price floored to the exchange's tick size.
+
+    Mirrors quantity_for()'s rounding direction and rationale: the exchange
+    rejects a price that is not an exact multiple of tickSize with -1111,
+    and floats accumulate noise that a naive round() can push onto an
+    invalid tick. Floors rather than rounds to nearest so a BUY rung never
+    creeps above its intended price (which could turn a resting order
+    marketable) and a SELL rung never creeps below (same risk, mirrored)."""
+    ticks = math.floor(round(price / filters.tick_size, 8))
+    return round(ticks * filters.tick_size, 8)
+```
+
+- [ ] **Step 4: Run tests, verify they pass**
+
+Run: `.viper/Scripts/python.exe -m pytest tests/test_market.py tests/test_execution.py tests/test_ladder.py -v`
+Expected: all PASS. Then run the full suite once:
+
+Run: `.viper/Scripts/python.exe -m pytest tests/ -v`
+Expected: all PASS — confirm no other test constructs a bare `Filters(...)` that this change missed (grep the whole repo for `Filters(` if any fail).
+
+- [ ] **Step 5: Retrofit `_place_ladder`**
+
+`futures/bot.py`'s `_place_ladder` (added in Task 13) currently calls
+`execution.place_limit_order(api, cfg.symbol, order.side, qty, order.price)`
+with the raw, unrounded `order.price`. Change this one call site to round
+first:
+
+```python
+# futures/bot.py — in _place_ladder, change the placement call
+
+        rounded_price = execution.price_for(order.price, filters)
+        result = execution.place_limit_order(api, cfg.symbol, order.side, qty, rounded_price)
+        ladder_state.orders[rounded_price] = result["orderId"]
+```
+
+(Track the rung by its *rounded* price, not the theoretical one — this is
+the price that will actually appear in `market.get_open_orders`' responses,
+which Task 15+'s diffing logic compares against.)
+
+Add one test confirming the rounded price is what's actually sent:
+
+```python
+# tests/test_tick_throttle.py — add
+
+def test_ladder_orders_are_placed_at_tick_rounded_prices(monkeypatch, written):
+    api = LoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, written, ticks=1, api=api)
+    for order in api.placed_orders:
+        if order.get("type") == "LIMIT":
+            # ETHUSDT tick size in this fixture is 0.01 -- every price must
+            # be an exact multiple, not a raw theoretical rung price.
+            assert round(order["price"] / 0.01) == pytest.approx(order["price"] / 0.01, abs=1e-6)
+```
+
+- [ ] **Step 6: Run tests, verify they pass; commit**
+
+Run: `.viper/Scripts/python.exe -m pytest tests/ -v`
+Expected: all PASS.
+
+```bash
+git add futures/market.py futures/execution.py futures/bot.py tests/test_market.py tests/test_execution.py tests/test_ladder.py tests/test_tick_throttle.py
+git commit -m "feat: round ladder limit-order prices to the exchange tick size"
+```
+
+---
+
 ### Task 14: `bot.py` — cancel the ladder on zone change and HALT
 
 **Files:**
