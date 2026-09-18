@@ -275,6 +275,57 @@ def apply_liquidation_cap(
     )
 
 
+def trim_scale(orders: tuple[DesiredOrder, ...], position_qty: float, trend: str) -> float:
+    """Safety factor k in [0, 1] to scale the TRIM-side orders (SELL for a
+    LONG trend, BUY for a SHORT one) by, so that filling every one of them at
+    once could never take out more than the position that genuinely exists
+    right now.
+
+    desired_orders() prices the trim side purely from the zone's geometry and
+    the current price -- it has no idea how much of a position it is
+    trimming actually exists. On a fresh zone activation (or any tick where
+    the accumulate side has not yet caught up with what the trim side
+    assumes), that produces trim rungs sized as if the position already sat
+    at this zone's full target. If price runs up through one of them before
+    the accumulate side has filled, that SELL rung fills against a position
+    smaller than its size -- at the extreme, a completely flat one -- and
+    the exchange (no hedge mode) opens a SHORT the operator never asked for
+    on a LONG-trend ladder, or the mirror image on a SHORT one.
+
+    position_qty=0 makes k=0.0: no trim rung goes out at all until an
+    accumulate fill gives the ladder something to trim against, which is
+    "sell orders are only examined once a position exists" applied as a
+    hard cap rather than a one-time gate, so it keeps holding as the
+    position changes on every later placement and reconcile too.
+
+    Quantity, not notional, is what must not be exceeded -- an order's size
+    is its own rung's notional, and rungs sit at different prices, so their
+    notionals cannot be summed and compared against a quantity directly.
+    Each is converted through ITS OWN price, mirroring the same
+    notional-over-current-price approximation liquidation_scale's caller
+    uses for the accumulate side."""
+    trim_side = "SELL" if trend == LONG else "BUY"
+    total_trim_qty = sum(o.size / o.price for o in orders if o.side == trim_side and o.price > 0)
+    if total_trim_qty <= 0:
+        return 1.0
+    return min(1.0, position_qty / total_trim_qty)
+
+
+def apply_trim_cap(
+    orders: tuple[DesiredOrder, ...], scale: float, trend: str
+) -> tuple[DesiredOrder, ...]:
+    """Scale down only the trim-side orders (SELL for long, BUY for short) by
+    `scale`; the accumulate side -- already governed by the liquidation cap,
+    a separate concern -- is untouched. `scale` comes from trim_scale()."""
+    trim_side = "SELL" if trend == LONG else "BUY"
+    return tuple(
+        DesiredOrder(price=o.price, side=o.side, size=o.size * scale)
+        if o.side == trim_side
+        else o
+        for o in orders
+    )
+
+
 def validate_orders(
     orders: tuple[DesiredOrder, ...],
     current_price: float,

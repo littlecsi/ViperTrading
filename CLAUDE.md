@@ -253,6 +253,29 @@ collection.
   waiting for the next placement or reconcile to notice. See the design doc's "Liquidation-aware buy-side
   cap" for the formula; do not remove `_liquidation_breached` or trust the projection alone, since a
   position that already reads breached is precisely the case it was added to catch.
+- **The trim side has its own cap, separate from the liquidation cap and against a different fact**
+  (`ladder.trim_scale`/`apply_trim_cap`, applied in both `_place_ladder` and `_reconcile_ladder`
+  alongside the existing accumulate-side liquidation cap). `desired_orders()` prices the trim side
+  (SELL for `long`, BUY for `short`) purely from the zone's geometry and the current price — it has no
+  idea how much of a position it is trimming actually exists. Uncapped, a zone activation from flat (or
+  from a position the accumulate side has not caught up with yet) rests trim rungs sized as if the
+  position already sat at this zone's full target. If price ran through one of them before the
+  accumulate side had filled anything, the fill would go through against a smaller position than the
+  rung assumed — at the extreme, a completely flat one — and the exchange (no hedge mode) would open a
+  position in the OPPOSITE direction from the configured trend: a SHORT out of a `long`-trend ladder, or
+  a LONG out of a `short`-trend one. `trim_scale` closes this the same way `liquidation_scale` closes
+  the accumulate side's own risk: a factor `k` in `[0, 1]`, computed by converting every trim rung's
+  notional through ITS OWN price into quantity and comparing the total to the position that is REALLY
+  open (read off the same snapshot the accumulate cap uses), then `apply_trim_cap` scales every trim
+  rung by it uniformly. `k = 0.0` at a flat position — no trim rung goes out at all until an accumulate
+  fill gives the ladder something to trim against — and `k` rises with the position on every later
+  placement and reconcile too, not just once at activation, so a growing position progressively unlocks
+  more of the trim side as it goes. This is deliberately a separate cap from the liquidation guard, not
+  folded into it: the liquidation cap answers "is this accumulation safe" and only ever touches the
+  accumulate side; `trim_scale` answers "does this position actually exist" and only ever touches the
+  trim side, and the two must stay independent because a position can be safe from a liquidation
+  standpoint while still being too small to back the trim side's full geometry (the common case, on
+  every fresh activation).
 - **A fill that first becomes visible on the same poll as an exit is not journalled — a known,
   deliberately deferred gap** (`bot._log_ladder_fills`'s docstring). Every exit — `STOP_OUT`,
   `HALT_FLATTEN`, the dead-band `SCALE_OUT`, a zone change, a symbol change — tears the ladder down

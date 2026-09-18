@@ -327,6 +327,18 @@ def _place_ladder(
         if scale < 1.0:
             desired = ladder.apply_liquidation_cap(desired, scale, cfg.trend)
 
+    # The trim side is capped separately, against the position that is REALLY
+    # open right now rather than against risk: desired_orders() prices it
+    # purely from zone geometry, so an activation ladder from flat (or from a
+    # position the accumulate side has not caught up to yet) would otherwise
+    # rest SELL rungs sized as if the position already sat at this zone's full
+    # target. A fill against one of those before the accumulate side has built
+    # that position opens a SHORT the operator never asked for on a LONG-trend
+    # ladder - see ladder.trim_scale.
+    trim_k = ladder.trim_scale(desired, abs(snapshot.position_amt), cfg.trend)
+    if trim_k < 1.0:
+        desired = ladder.apply_trim_cap(desired, trim_k, cfg.trend)
+
     valid, _deferred = ladder.validate_orders(desired, price, cfg.trend, filters)
     placed = 0
     for order in valid:
@@ -646,6 +658,15 @@ def _reconcile_ladder(
             trend=cfg.trend,
         )
     capped = ladder.apply_liquidation_cap(desired, scale, cfg.trend) if scale < 1.0 else desired
+
+    # Same trim-side cap as _place_ladder, against the same REAL position_qty
+    # already read above - a reconcile rebuilds the trim side from zone
+    # geometry exactly as an activation does, so it is just as capable of
+    # sizing a SELL rung (LONG) or BUY rung (SHORT) past what the position
+    # this tick actually holds can back.
+    trim_k = ladder.trim_scale(capped, position_qty, cfg.trend)
+    if trim_k < 1.0:
+        capped = ladder.apply_trim_cap(capped, trim_k, cfg.trend)
 
     valid, _deferred = ladder.validate_orders(capped, price, cfg.trend, filters)
     open_orders = market.get_open_orders(api, cfg.symbol)

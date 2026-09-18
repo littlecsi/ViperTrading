@@ -609,6 +609,87 @@ def test_a_resting_ladder_does_not_flood_the_tick_journal(monkeypatch, written):
     assert len(ladder_ticks) == 5  # 300s at a 1s poll, not 300 records
 
 
+# --- the trim side cannot open a position in the wrong direction -----------
+#
+# desired_orders() prices BOTH sides of the ladder from zone geometry and the
+# current price alone, with no idea how much of a position the trim side is
+# actually trimming. Uncapped, a zone activation from flat rests SELL rungs
+# (LONG) or BUY rungs (SHORT) sized as if the position already sat at this
+# zone's full target; if price runs through one of them before the accumulate
+# side has filled anything, the exchange (no hedge mode) opens a position in
+# the OPPOSITE direction from the configured trend. ladder.trim_scale closes
+# this by capping the trim side's total planned quantity to the position that
+# genuinely exists.
+
+
+def test_activation_from_flat_places_no_sell_orders_for_long(monkeypatch, written):
+    """The exact failure this fix closes: a LONG-trend activation from a flat
+    position used to rest SELL rungs above current price. A fill against one
+    of them, before any BUY rung had a chance to build the long position,
+    opened a SHORT the operator never asked for."""
+    api = LoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, written, ticks=1, api=api)
+
+    sides = [o["side"] for o in api.placed_orders if o.get("type") == "LIMIT"]
+    assert sides.count("BUY") > 0  # the accumulate side still goes out
+    assert sides.count("SELL") == 0  # nothing to trim yet, so nothing rests
+
+
+def test_activation_from_flat_places_no_buy_orders_for_short(monkeypatch, written):
+    """Mirror of the LONG case: for a SHORT trend the trim side is BUY, and an
+    uncapped BUY rung filling from flat would open a LONG position instead."""
+    base = bot.settings.load()
+    flipped = bot.settings.Settings(**{**base.__dict__, "trend": "short"})
+    api = LoopClient(price="2500.00", balance="1000.0")
+    run_loop(monkeypatch, written, ticks=1, api=api, load=lambda: flipped)
+
+    sides = [o["side"] for o in api.placed_orders if o.get("type") == "LIMIT"]
+    assert sides.count("SELL") > 0  # the accumulate side still goes out
+    assert sides.count("BUY") == 0  # nothing to trim yet, so nothing rests
+
+
+def test_sell_side_is_capped_to_the_open_long_position(monkeypatch, written):
+    """A partially built LONG position caps the trim side to what it can
+    actually back - not zero (some position exists) and not the full
+    zone-geometry size (the position does not cover all of it)."""
+    api = LoopClient(
+        price="2500.00", balance="1000.0",
+        position="0.05", entry_price="2500.00",
+    )
+    run_loop(monkeypatch, written, ticks=1, api=api)
+
+    sell_qty = sum(
+        o["quantity"] for o in api.placed_orders
+        if o.get("type") == "LIMIT" and o["side"] == "SELL"
+    )
+    assert 0 < sell_qty <= 0.05 + 0.001  # step_size slack from lot-step flooring
+
+
+def test_buy_side_is_capped_to_the_open_short_position(monkeypatch, written):
+    """Mirror of the LONG case: a partially built SHORT position caps the BUY
+    (trim) side to what it can actually back.
+
+    Patches settings.load directly, rather than via run_loop's `load`
+    parameter, because that parameter deliberately leaves the very first call
+    (run()'s preamble, before the loop) on the real config - it exists to
+    simulate a reload arriving mid-run, not a bot that starts short. A short
+    position checked against the real config's LONG trend would trip the
+    startup reconciliation guard before the ladder is ever reached."""
+    flipped = bot.settings.Settings(**{**bot.settings.load().__dict__, "trend": "short"})
+    monkeypatch.setattr(bot.settings, "load", lambda: flipped)
+    api = LoopClient(
+        price="2500.00", balance="1000.0",
+        position="-0.05", entry_price="2500.00",
+    )
+    run_loop(monkeypatch, written, ticks=1, api=api)
+
+    buy_qty = sum(
+        o["quantity"] for o in api.placed_orders
+        if o.get("type") == "LIMIT" and o["side"] == "BUY"
+    )
+    assert 0 < buy_qty <= 0.05 + 0.001
+
+
 def test_a_partly_rejected_ladder_is_not_re_placed_every_tick(monkeypatch, written):
     """The rungs accepted before a rejection are LIVE on the exchange. If
     active_index did not advance past a placement that raised, the next tick
@@ -640,12 +721,21 @@ def test_the_activation_ladder_is_capped_by_the_liquidation_guard(monkeypatch, w
     assert safe_sides.count("BUY") > 0  # uncapped: the accumulate side goes out
 
     risky_cfg = bot.settings.Settings(**{**bot.settings.load().__dict__, "leverage": 10})
-    risky = LoopClient(price="2500.00", balance="1000.0")
+    # A small existing position, not flat: the trim side has its own cap now
+    # (ladder.trim_scale), and a flat position caps it to nothing regardless
+    # of the liquidation guard - which would make "SELL > 0" below a test of
+    # the wrong cap. This position is too small to change the liquidation
+    # guard's own verdict (still fully unsafe at 10x).
+    risky = LoopClient(
+        price="2500.00", balance="1000.0",
+        position="0.05", entry_price="2500.00",
+    )
     run_loop(monkeypatch, [], ticks=1, api=risky, load=lambda: risky_cfg)
     risky_sides = [o["side"] for o in risky.placed_orders]
     assert risky_sides.count("BUY") == 0  # capped away entirely
-    # Not simply "nothing was placed": the trim side is untouched by the cap,
-    # which is what makes this a cap and not a refusal to trade the zone.
+    # Not simply "nothing was placed": the trim side is untouched by the
+    # LIQUIDATION cap, which is what makes this a cap and not a refusal to
+    # trade the zone.
     assert risky_sides.count("SELL") > 0
 
 
@@ -933,10 +1023,16 @@ def test_a_filled_rung_enters_settling_without_reconciling_the_same_tick(monkeyp
 # diff, not a re-place: rungs that still match are left resting.
 
 
-def resting_ladder_ids(monkeypatch):
+def resting_ladder_ids(monkeypatch, position="0.0"):
     """The rung ids one tick at 2500 rests, taken from a control run so the
-    expectation tracks the real zone geometry rather than a hard-coded count."""
-    control = LoopClient(price="2500.00", balance="1000.0")
+    expectation tracks the real zone geometry rather than a hard-coded count.
+
+    `position` must match the position the real test's LoopClient starts
+    from: the trim side is now capped to what that position can back (see
+    ladder.trim_scale), so the rung SET this returns -- not just their sizes
+    -- depends on it. A flat control run no longer stands in for a test whose
+    api starts from an existing position."""
+    control = LoopClient(price="2500.00", balance="1000.0", position=position)
     run_loop(monkeypatch, [], ticks=1, api=control)
     return [o["orderId"] for o in control._open_orders]
 
@@ -1203,7 +1299,10 @@ def test_a_fill_taken_out_by_a_halt_is_still_journalled(monkeypatch, written):
     most likely fill there is (the move that fills it is the move that triggers
     the exit), and journalling only at the prune point would lose it."""
     order_journal = []
-    all_ids = resting_ladder_ids(monkeypatch)
+    # Matches the api below's starting position: with it open, some trim-side
+    # rungs are eligible too, so a flat control run would predict the wrong
+    # rung set entirely, not just the wrong sizes.
+    all_ids = resting_ladder_ids(monkeypatch, position="0.2")
 
     api = LoopClient(
         price="2500.00", balance="1000.0", position="0.2",
@@ -1499,10 +1598,19 @@ def first_tick_ladder(monkeypatch, position="0.0"):
 
 def test_a_zone_change_cancels_the_old_zones_ladder(monkeypatch, written):
     """Zone 1 (2371.26-2625.00) activates at 2500 and rests a ladder. Price
-    then falls to 2200, past the stop_buffer below that support, so zone 2
+    then rises to 2700, past the stop_buffer above that resistance, so zone 0
     takes over: the old zone's rungs are priced for a zone the bot has left and
-    must be cancelled, not merely forgotten, before the new ladder goes on."""
-    api = LoopClient(price="2500.00", balance="1000.0", price_schedule={3: "2200.00"})
+    must be cancelled, not merely forgotten, before the new ladder goes on.
+
+    Rising into zone 0 rather than falling into zone 2: zone 2 is the LOWEST
+    zone in the ladder, so its survival price falls back to its own span
+    (ladder.survival_price) rather than the next zone's, which makes it tight
+    enough that a fully flat, zero-isolated-margin 5x entry there is already
+    unsafe by the pre-existing liquidation cap alone - capping the accumulate
+    side to nothing regardless of this fix. Zone 0 uses the next-zone formula,
+    same as zone 1's own activation above, so it stays uncapped and isolates
+    what this test is actually about."""
+    api = LoopClient(price="2500.00", balance="1000.0", price_schedule={3: "2700.00"})
     run_loop(monkeypatch, written, ticks=2, api=api)
 
     first = first_tick_ladder(monkeypatch)
@@ -1702,11 +1810,17 @@ def test_a_trend_flip_cancels_the_ladder_priced_for_the_old_direction(monkeypatc
 def test_a_failed_cancel_is_retried_rather_than_stranding_the_old_rungs(monkeypatch, written):
     """A cancel that fails has placed nothing, so the zone change must stay
     unfinished and be retried. Advancing past it would leave the old zone's
-    rungs live on the book while the bot counted them as the new zone's."""
+    rungs live on the book while the bot counted them as the new zone's.
+
+    Rises into zone 0 rather than falling into zone 2, for the same reason as
+    test_a_zone_change_cancels_the_old_zones_ladder: zone 2's tighter,
+    own-span survival price already caps a flat, zero-margin 5x entry there
+    to nothing, which is a fact about the pre-existing liquidation cap and
+    would otherwise be indistinguishable from a failed retry never landing."""
     from binance.error import ClientError
 
     api = LoopClient(
-        price="2500.00", balance="1000.0", price_schedule={3: "2200.00"},
+        price="2500.00", balance="1000.0", price_schedule={3: "2700.00"},
         cancel_error=lambda n: ClientError(400, -1001, "Internal error", {}) if n == 1 else None,
     )
     records = run_loop(monkeypatch, written, ticks=3, api=api)

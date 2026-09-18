@@ -309,6 +309,71 @@ def test_apply_liquidation_cap_shrinks_only_the_sell_side_for_short():
             assert adjusted.size == original.size
 
 
+def test_trim_scale_flat_position_returns_zero_when_trim_orders_exist():
+    orders = (
+        ladder.DesiredOrder(price=2400.0, side="BUY", size=100.0),
+        ladder.DesiredOrder(price=2500.0, side="SELL", size=50.0),
+    )
+    assert ladder.trim_scale(orders, position_qty=0.0, trend=LONG) == 0.0
+
+
+def test_trim_scale_position_covering_the_full_trim_side_returns_one():
+    orders = (
+        ladder.DesiredOrder(price=2500.0, side="SELL", size=50.0),   # qty 0.02
+        ladder.DesiredOrder(price=2600.0, side="SELL", size=26.0),   # qty 0.01
+    )
+    assert ladder.trim_scale(orders, position_qty=0.03, trend=LONG) == pytest.approx(1.0)
+
+
+def test_trim_scale_position_beyond_the_trim_side_still_caps_at_one():
+    orders = (ladder.DesiredOrder(price=2500.0, side="SELL", size=50.0),)  # qty 0.02
+    assert ladder.trim_scale(orders, position_qty=10.0, trend=LONG) == pytest.approx(1.0)
+
+
+def test_trim_scale_partial_position_scales_proportionally():
+    orders = (
+        ladder.DesiredOrder(price=2500.0, side="SELL", size=50.0),   # qty 0.02
+        ladder.DesiredOrder(price=2600.0, side="SELL", size=26.0),   # qty 0.01
+    )
+    # total trim qty = 0.03, position covers half of it.
+    assert ladder.trim_scale(orders, position_qty=0.015, trend=LONG) == pytest.approx(0.5)
+
+
+def test_trim_scale_no_trim_orders_is_not_a_division_by_zero():
+    orders = (ladder.DesiredOrder(price=2400.0, side="BUY", size=100.0),)
+    assert ladder.trim_scale(orders, position_qty=0.0, trend=LONG) == 1.0
+
+
+def test_trim_scale_mirrors_for_short_where_buy_is_the_trim_side():
+    orders = (
+        ladder.DesiredOrder(price=2400.0, side="BUY", size=50.0),   # qty 50/2400
+        ladder.DesiredOrder(price=2600.0, side="SELL", size=100.0),  # accumulate side, ignored
+    )
+    assert ladder.trim_scale(orders, position_qty=0.0, trend=SHORT) == 0.0
+    full_cover = 50.0 / 2400.0
+    assert ladder.trim_scale(orders, position_qty=full_cover, trend=SHORT) == pytest.approx(1.0)
+
+
+def test_apply_trim_cap_shrinks_only_the_sell_side_for_long():
+    orders = ladder.desired_orders(ZONE, LONG, max_n=5000.0, alpha=2.0, rung_spacing_pct=0.005, current_price=2500.0)
+    capped = ladder.apply_trim_cap(orders, scale=0.5, trend=LONG)
+    for original, adjusted in zip(orders, capped):
+        if original.side == "SELL":
+            assert adjusted.size == pytest.approx(original.size * 0.5)
+        else:
+            assert adjusted.size == original.size
+
+
+def test_apply_trim_cap_shrinks_only_the_buy_side_for_short():
+    orders = ladder.desired_orders(ZONE, SHORT, max_n=5000.0, alpha=2.0, rung_spacing_pct=0.005, current_price=2500.0)
+    capped = ladder.apply_trim_cap(orders, scale=0.5, trend=SHORT)
+    for original, adjusted in zip(orders, capped):
+        if original.side == "BUY":
+            assert adjusted.size == pytest.approx(original.size * 0.5)
+        else:
+            assert adjusted.size == original.size
+
+
 def test_validate_orders_accepts_correctly_sided_orders():
     orders = (
         ladder.DesiredOrder(price=2400.0, side="BUY", size=100.0),
