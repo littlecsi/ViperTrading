@@ -77,8 +77,9 @@ settings reloads without unhandled exceptions.
    Should print your USDT balance (testnet by default) if the keys/connection are good.
 5. Run the test suite to confirm the environment is sound:
    ```
-   .viper/Scripts/python.exe -m pytest tests/ -v
+   .viper/bin/python -m pytest tests/ -v
    ```
+   (on Windows: `.viper\Scripts\python.exe -m pytest tests/ -v`).
    All 58 tests should pass.
 6. **Do not run `python futures/bot.py`** unless you intend to place real orders — even on testnet, it
    trades against a live (test) exchange, not a simulation.

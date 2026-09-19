@@ -107,11 +107,15 @@ Run from a directory where `futures/` modules can be imported as top-level modul
 and run `python bot.py`, or run with `futures/` on `PYTHONPATH`) — `futures/` is not a package and its
 modules use flat imports (`import market`, `from settings import Zone`, etc.), not `futures.market`.
 
-Tests live under `tests/`, run with:
+Tests live under `tests/`, run with the `.viper` virtualenv's interpreter:
 
 ```
-.viper/Scripts/python.exe -m pytest tests/ -v
+.viper/bin/python -m pytest tests/ -v
 ```
+
+The venv layout is platform-dependent: `.viper/bin/python` on macOS/Linux, `.viper\Scripts\python.exe`
+on Windows. This repo has been worked on from both, so don't hardcode one form into a new doc or
+script without noting the other.
 
 `tests/conftest.py` inserts `futures/` onto `sys.path` so the flat imports resolve during test
 collection.

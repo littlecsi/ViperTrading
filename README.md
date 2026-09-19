@@ -64,7 +64,8 @@ before ever switching to live trading.
 To verify your setup, run the test suite:
 
 ```
-.viper/Scripts/python.exe -m pytest tests/ -v
+.viper/bin/python -m pytest tests/ -v
 ```
 
-(adjust the interpreter path to wherever your virtual environment lives).
+(on Windows the same interpreter is `.viper\Scripts\python.exe`; adjust the path if your virtual
+environment lives elsewhere).
