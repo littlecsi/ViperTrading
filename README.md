@@ -27,6 +27,46 @@ that sizes positions based on price proximity to operator-defined support/resist
   testnet or the live account. Each mode has its own settings file and its own journal, and the two
   share one copy of the trading code, so behaviour cannot drift between them.
 
+## Project structure
+
+```
+futures/                  the active system
+  bot.py                  entry point: the polling loop, and MODE
+  env.py                  MODE -> exchange, settings file, journal directory
+  settings.py             Settings/Zone dataclasses and a validating load()
+  client.py               builds the Binance UMFutures client; corrects clock drift
+  market.py               exchange reads (one REST call per endpoint per tick)
+  strategy.py             pure decision logic - no I/O, no client, no clock
+  ladder.py               pure limit-order-ladder computation
+  execution.py            order placement, cancellation, lot/tick rounding
+  journal.py              JSONL tick and order logs
+  config.py               API credentials - GITIGNORED, create it yourself
+  notify.py               Telegram formatting and sending
+
+  test/settings.json      testnet config      } one per mode,
+  live/settings.json      live config         } re-read every tick
+  test/logs/              testnet journals    } gitignored,
+  live/logs/              live journals       } created on first write
+
+tests/                    321 tests; conftest.py puts futures/ on sys.path
+docs/superpowers/         design specs and implementation plans
+binance/                  LEGACY Spot bot - out of scope, unused
+```
+
+`futures/` is **not a Python package.** Its modules import each other flatly (`import market`, not
+`futures.market`), so run the bot and its scripts from inside `futures/`, or put that directory on
+`PYTHONPATH`.
+
+Three boundaries are deliberate and worth preserving:
+
+- **`strategy.py` and `ladder.py` are pure.** Plain values in, a decision or an order set out. This is
+  the seam a reinforcement-learning policy will later replace, and it is what makes them exhaustively
+  testable without an exchange. Don't give them a client, a network call, or a clock.
+- **Only `client.py` reads credentials.** `env.py` resolves modes without importing `config.py`, which
+  keeps it — and its tests — working on a fresh clone where that gitignored file does not exist.
+- **Only `bot.py` holds mutable state.** Every other module is stateless and takes its inputs as
+  arguments.
+
 ## Setup
 
 1. Install dependencies (Python 3.10+ recommended):
