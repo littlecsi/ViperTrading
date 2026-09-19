@@ -16,6 +16,9 @@ futures/logs/
 # Local scratch / test scripts
 test.py
 
+# Claude Code skill lockfile (machine-computed hashes)
+skills-lock.json
+
 # Misc
 *.xlsx
 *.png

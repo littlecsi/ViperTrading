@@ -1,0 +1,8 @@
+{
+  "enabledPlugins": {
+    "superpowers@superpowers-dev": true,
+    "ecc@ecc": true,
+    "andrej-karpathy-skills@karpathy-skills": true,
+    "mattpocock-skills@mattpocock": true
+  }
+}
