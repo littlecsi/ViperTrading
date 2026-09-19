@@ -19,9 +19,6 @@ Nothing here touches the network: requests.post is replaced in every test, and
 the credentials are fakes.
 """
 
-import json
-from pathlib import Path
-
 import pytest
 
 import bot
@@ -216,9 +213,60 @@ def test_a_send_that_raises_does_not_escape(monkeypatch):
 
 
 def order_record(**overrides):
-    """The real recorded fill from futures/logs/orders-2026-09-16.jsonl."""
-    path = Path(__file__).resolve().parent.parent / "futures/logs/orders-2026-09-16.jsonl"
-    record = json.loads(path.read_text().splitlines()[-1])
+    """A recorded SCALE_IN fill, in the exact shape bot.run() hands to
+    journal.log_order and then to notify.format_order.
+
+    A literal, like halt_values() and refusal_record() below it. It used to
+    read the last line of futures/logs/orders-2026-09-16.jsonl - a real fill,
+    but futures/logs/ is gitignored, so the fixture only existed on the one
+    machine that happened to have run the bot that day. Every other clone got
+    eleven FileNotFoundErrors. A test fixture cannot live in a runtime artifact.
+
+    The numbers are the originals, and they are self-consistent under the real
+    strategy.py formulas rather than merely plausible - d is
+    distance(2395.06, zone, "long"), max_notional is balance * leverage *
+    exposure_fraction, target_notional is max_n * d ** alpha, and the delta
+    against position_before floors to exactly the 0.876 that was bought:
+
+        d      = (2625.00 - 2395.06) / (2625.00 - 2371.26) = 0.90620...
+        max_n  = 4992.6020844769955 * 5 * 1.0              = 24963.01
+        target = max_n * d ** 2.0                          = 20499.73
+        qty    = floor((target - 7.683 * 2395.06) / 2395.06 / 0.001) * 0.001
+
+    fill_price and notional are None on purpose: this is the avgPrice "0.00"
+    with no cumQuote case (see execution.fill_from_response), which is what
+    test_order_message_says_so_when_the_exchange_reported_no_fill is about. The
+    tests that want a reported fill override both."""
+    record = {
+        "order_id": 16795863483,
+        "client_order_id": "x-15PC0Ll7a1b2c3d4e5f6a7b8c9d0e1",
+        "symbol": "ETHUSDT",
+        "side": "BUY",
+        "reason": "scale_in",
+        "quantity": 0.876,
+        "executed_qty": 0.876,
+        "fill_price": None,
+        "notional": None,
+        "commission": None,
+        "commission_asset": None,
+        "reduce_only": False,
+        "mark_price": 2395.06,
+        "trend": "long",
+        "leverage": 5,
+        "alpha": 2.0,
+        "exposure_fraction": 1.0,
+        "active_zone_index": 1,
+        "support": 2371.26,
+        "resistance": 2625.0,
+        "d": 0.9062032001261143,
+        "max_notional": 24963.010422384978,
+        "target_notional": 20499.73,
+        "position_before": 7.683,
+        "position_after": 8.559,
+        "balance": 4992.6020844769955,
+        "available_balance": 1174.82,
+        "unrealized_pnl": -37.41,
+    }
     record.update(overrides)
     return record
 
