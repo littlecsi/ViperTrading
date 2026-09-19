@@ -2,8 +2,6 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-SETTINGS_PATH = str(Path(__file__).resolve().parent / "settings.json")
-
 LONG = "long"
 SHORT = "short"
 
@@ -24,7 +22,6 @@ class Settings:
     rebalance_threshold: float
     stop_buffer: float
     poll_seconds: int
-    testnet: bool
     rung_spacing_pct: float
     liquidation_buffer_pct: float
     zones: tuple[Zone, ...]
@@ -49,7 +46,19 @@ def _parse_zones(raw) -> tuple[Zone, ...]:
     return tuple(zones)
 
 
-def load(path: str = SETTINGS_PATH) -> Settings:
+def load(path: str) -> Settings:
+    """Read and validate one mode's settings.json.
+
+    `path` is required, and comes from env.settings_path(MODE). There is no
+    default: each mode owns a file under its own folder, so a caller that
+    passes nothing has not said which environment it means.
+
+    Note what is NOT read here: which exchange to trade. That is env.MODE, a
+    constant in bot.py. This file is re-read every tick, and a selector that
+    can change under a running bot is one that can swap accounts while a
+    leveraged position is open. A "testnet" key left over in an operator's old
+    file is therefore ignored rather than honoured - silently, because failing
+    the load would take the whole configuration down over a dead key."""
     data = json.loads(Path(path).read_text())
 
     trend = data["trend"]
@@ -102,7 +111,6 @@ def load(path: str = SETTINGS_PATH) -> Settings:
         rebalance_threshold=rebalance_threshold,
         stop_buffer=stop_buffer,
         poll_seconds=poll_seconds,
-        testnet=bool(data["testnet"]),
         rung_spacing_pct=rung_spacing_pct,
         liquidation_buffer_pct=liquidation_buffer_pct,
         zones=_parse_zones(data["zones"]),

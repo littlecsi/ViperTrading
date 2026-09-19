@@ -4,9 +4,10 @@
 
 The zone-scaling Futures bot is **implemented and testnet-validated**:
 
-- `futures/settings.py` + `futures/settings.json` — validated, hot-reloaded runtime configuration
-  (symbol, trend, leverage, alpha, exposure fraction, rebalance threshold, stop buffer, poll interval,
-  testnet flag, zone ladder).
+- `futures/settings.py` + `futures/<mode>/settings.json` — validated, hot-reloaded runtime
+  configuration (symbol, trend, leverage, alpha, exposure fraction, rebalance threshold, stop buffer,
+  poll interval, zone ladder), one file per mode.
+- `futures/env.py` — resolves `MODE` to an exchange, a settings file and a journal directory.
 - `futures/client.py` — builds the `UMFutures` client for either live or testnet credentials, and
   corrects for this machine's clock running ahead of Binance's server clock so signed requests aren't
   rejected.
@@ -14,8 +15,9 @@ The zone-scaling Futures bot is **implemented and testnet-validated**:
   quantity/filter handling, and JSONL tick/order logging.
 - `futures/strategy.py` — the pure zone-scaling decision logic.
 - `futures/bot.py` — the polling loop tying all of the above together. **This is the entry point:**
-  `python futures/bot.py`.
-- 58 tests under `tests/`, all passing.
+  `python futures/bot.py`. The `MODE` constant at the top of this file is what selects the testnet or
+  the live account; it is deliberately not a setting, so switching requires a restart.
+- 321 tests under `tests/`, all passing.
 - The bot has placed a **real order on Binance testnet** — a full decide -> size -> execute -> journal
   cycle has run end-to-end against the live testnet exchange, not just in tests.
 
@@ -38,10 +40,11 @@ settings reloads without unhandled exceptions.
 
 ### Known items to carry forward
 
-- **The live (non-testnet) Binance account holds a pre-existing open position unrelated to this bot.**
-  Do not point the bot at live (`"testnet": false` in `settings.json`) until that position has been
+- **The live Binance account holds a pre-existing open position unrelated to this bot.**
+  Do not point the bot at live (`MODE = env.LIVE` in `futures/bot.py`) until that position has been
   reconciled — the bot's position-sizing logic assumes it owns the entire position on the configured
-  symbol.
+  symbol. The startup reconciliation guard is expected to refuse the first live start while that
+  position is open; that is the guard working, not a bug.
 - **Testnet position sizes are larger than the original design assumed.** The testnet wallet holds
   ~5000 USDT; with `leverage: 5` and `exposure_fraction: 1.0` in the current `settings.json`, the
   maximum position is `5000 * 5 * 1.0` = ~$25,000 notional — five times the $1,000 wallet the original
@@ -72,14 +75,15 @@ settings reloads without unhandled exceptions.
    interchangeable.
 4. Verify the setup:
    ```
-   python futures/client.py
+   cd futures && python client.py
    ```
-   Should print your USDT balance (testnet by default) if the keys/connection are good.
+   Should print your USDT balance (testnet by default) if the keys/connection are good. Pass `live`
+   to check the live credentials instead; it places no orders either way.
 5. Run the test suite to confirm the environment is sound:
    ```
    .viper/bin/python -m pytest tests/ -v
    ```
    (on Windows: `.viper\Scripts\python.exe -m pytest tests/ -v`).
-   All 58 tests should pass.
+   All 321 tests should pass.
 6. **Do not run `python futures/bot.py`** unless you intend to place real orders — even on testnet, it
    trades against a live (test) exchange, not a simulation.

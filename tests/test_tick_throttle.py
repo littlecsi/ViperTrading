@@ -19,6 +19,17 @@ import journal
 import strategy
 
 
+def load_settings():
+    """The settings bot.run() would load, for the mode bot.py is set to.
+
+    settings.load takes a required path now - each mode owns a settings.json
+    under futures/<mode>/ - so there is no argument-free default to fall back
+    on. Read-only, and it reads the same file the loop does, which is the
+    point: a test building a Settings around a stale field list would pass
+    while the real load fails."""
+    return bot.settings.load(bot.env.settings_path(bot.MODE))
+
+
 class Clock:
     def __init__(self):
         self.t = 0.0
@@ -181,7 +192,7 @@ def test_throttle_is_elapsed_time_not_a_tick_count(written, clock):
 
 
 def test_config_changes_reports_only_what_changed():
-    old = bot.settings.load()
+    old = load_settings()
     new = bot.settings.Settings(**{**old.__dict__, "leverage": old.leverage + 1})
     assert bot._config_changes(old, new) == {"leverage": [old.leverage, old.leverage + 1]}
 
@@ -189,7 +200,7 @@ def test_config_changes_reports_only_what_changed():
 def test_config_changes_is_json_safe():
     import json
 
-    old = bot.settings.load()
+    old = load_settings()
     new = bot.settings.Settings(**{**old.__dict__, "zones": old.zones[:1], "trend": "short"})
     changes = bot._config_changes(old, new)
     assert set(changes) == {"zones", "trend"}
@@ -197,7 +208,7 @@ def test_config_changes_is_json_safe():
 
 
 def test_config_reloaded_record_is_written_unthrottled(written):
-    cfg = bot.settings.load()
+    cfg = load_settings()
     for _ in range(3):
         bot._log_config_reloaded(cfg, {"leverage": [5, 10]})
     assert len(written) == 3
@@ -436,7 +447,7 @@ def run_loop(monkeypatch, written, ticks, api=None, load=None, orders=None):
     real_ticklog = bot.TickLog
     order_records = [] if orders is None else orders
 
-    monkeypatch.setattr(bot.client, "build", lambda testnet: api)
+    monkeypatch.setattr(bot.client, "build", lambda mode: api)
     monkeypatch.setattr(bot, "TickLog", lambda *a, **kw: real_ticklog(clock=clock))
     monkeypatch.setattr(
         journal, "log_order", lambda record, log_dir=None: order_records.append(record)
@@ -638,7 +649,7 @@ def test_activation_from_flat_places_no_sell_orders_for_long(monkeypatch, writte
 def test_activation_from_flat_places_no_buy_orders_for_short(monkeypatch, written):
     """Mirror of the LONG case: for a SHORT trend the trim side is BUY, and an
     uncapped BUY rung filling from flat would open a LONG position instead."""
-    base = bot.settings.load()
+    base = load_settings()
     flipped = bot.settings.Settings(**{**base.__dict__, "trend": "short"})
     api = LoopClient(price="2500.00", balance="1000.0")
     run_loop(monkeypatch, written, ticks=1, api=api, load=lambda: flipped)
@@ -675,8 +686,10 @@ def test_buy_side_is_capped_to_the_open_short_position(monkeypatch, written):
     simulate a reload arriving mid-run, not a bot that starts short. A short
     position checked against the real config's LONG trend would trip the
     startup reconciliation guard before the ladder is ever reached."""
-    flipped = bot.settings.Settings(**{**bot.settings.load().__dict__, "trend": "short"})
-    monkeypatch.setattr(bot.settings, "load", lambda: flipped)
+    flipped = bot.settings.Settings(**{**load_settings().__dict__, "trend": "short"})
+    # Takes the path bot.run() now passes, and ignores it: this stub stands in
+    # for the whole file, whichever mode's file that is.
+    monkeypatch.setattr(bot.settings, "load", lambda path=None: flipped)
     api = LoopClient(
         price="2500.00", balance="1000.0",
         position="-0.05", entry_price="2500.00",
@@ -720,7 +733,7 @@ def test_the_activation_ladder_is_capped_by_the_liquidation_guard(monkeypatch, w
     safe_sides = [o["side"] for o in safe.placed_orders]
     assert safe_sides.count("BUY") > 0  # uncapped: the accumulate side goes out
 
-    risky_cfg = bot.settings.Settings(**{**bot.settings.load().__dict__, "leverage": 10})
+    risky_cfg = bot.settings.Settings(**{**load_settings().__dict__, "leverage": 10})
     # A small existing position, not flat: the trim side has its own cap now
     # (ladder.trim_scale), and a flat position caps it to nothing regardless
     # of the liquidation guard - which would make "SELL > 0" below a test of
@@ -974,7 +987,7 @@ class FakeLadderState:
 def test_detect_fill_reports_tracked_rungs_that_are_no_longer_open(monkeypatch):
     api = LoopClient()
     api._open_orders = [{"orderId": 2}, {"orderId": 3}]
-    cfg = bot.settings.load()
+    cfg = load_settings()
 
     # Keys are the tick-ROUNDED rung prices execution.price_for produced, which
     # is what the exchange has; the values are the ids the diff works on.
@@ -1732,7 +1745,7 @@ def test_a_failing_cancel_never_gates_the_halt_flatten(monkeypatch, written):
 def test_a_symbol_switch_cancels_the_old_symbols_ladder(monkeypatch, written):
     """Switching symbol resets the zone state, and the old symbol's rungs have
     to go with it - against the OLD symbol, which is where they are resting."""
-    base = bot.settings.load()
+    base = load_settings()
     switched = bot.settings.Settings(**{**base.__dict__, "symbol": "BTCUSDT"})
     calls = {"n": 0}
 
@@ -1788,7 +1801,7 @@ def test_a_trend_flip_cancels_the_ladder_priced_for_the_old_direction(monkeypatc
     next BUY fill builds the position the operator just abandoned. Cancelled
     against the OLD cfg - that is where the rungs are - so the next tick
     re-places from scratch."""
-    base = bot.settings.load()
+    base = load_settings()
     flipped = bot.settings.Settings(**{**base.__dict__, "trend": "short"})
     calls = {"n": 0}
 

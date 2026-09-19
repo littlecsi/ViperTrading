@@ -19,12 +19,17 @@ The active system lives in `futures/`:
   `ladder.rung_prices`) and `liquidation_buffer_pct` (the safety margin `ladder.survival_price` applies
   beyond the next zone). Both are hot-reloaded like every other field, so both are validated the same
   way (`(0, 1)` / `[0, 1)`) rather than trusted as startup-only constants.
-- `futures/settings.json` — runtime config (symbol, trend, leverage, alpha, exposure fraction,
-  rebalance threshold, stop buffer, poll interval, testnet flag, rung spacing, liquidation buffer, zone
-  ladder). Re-read every tick — see architecture notes below.
-- `futures/client.py` — `build(testnet)` constructs the Binance `UMFutures` client; also measures the
-  offset between this machine's clock and Binance's server clock at startup and patches
-  `binance.api.get_timestamp` with it.
+- `futures/env.py` — the mode resolver. `TEST`/`LIVE`/`MODES`, a fail-closed `validate()`, and
+  `is_testnet()`, `label()`, `settings_path()`, `log_dir()`. Pure, and deliberately does **not**
+  `import config` (see architecture notes).
+- `futures/test/settings.json`, `futures/live/settings.json` — per-mode runtime config (symbol,
+  trend, leverage, alpha, exposure fraction, rebalance threshold, stop buffer, poll interval, rung
+  spacing, liquidation buffer, zone ladder). Re-read every tick — see architecture notes below.
+  There is **no `testnet` field**: which account is traded is `bot.MODE`, not a setting.
+- `futures/client.py` — `build(mode)` constructs the Binance `UMFutures` client, picking the
+  credential pair via `env.is_testnet(mode)`; also measures the offset between this machine's clock
+  and Binance's server clock at startup and patches `binance.api.get_timestamp` with it.
+  `check_connection(mode)` is the operator smoke check, and `python client.py` defaults it to `test`.
 - `futures/market.py` — exchange reads: `get_snapshot()` returns a frozen `Snapshot` (mark price,
   signed position amount, unrealized PnL, wallet balance, available balance, entry price, isolated
   wallet, liquidation price) from one call per endpoint, built out of pure extractors
@@ -50,17 +55,18 @@ The active system lives in `futures/`:
 - `futures/execution.py` — quantity flooring to the lot step, exchange filter checks, market- and
   limit-order placement (`place_limit_order`), side-aware price rounding to the tick size (`price_for`),
   and order cancellation/lookup (`cancel_orders`, `cancel_all_orders`, `query_order_result`).
-- `futures/journal.py` — two JSONL logs under `futures/logs/` (gitignored): `ticks-YYYY-MM-DD.jsonl`
+- `futures/journal.py` — two JSONL logs under `futures/<mode>/logs/` (gitignored): `ticks-YYYY-MM-DD.jsonl`
   (one line per record the loop hands it — a repeated state is written at most once per interval, see
   architecture notes below; `journal.py` writes, it does not decide) and `orders-YYYY-MM-DD.jsonl` (one
   line per executed order, carrying a full environment snapshot at fill time).
 - `futures/notify.py` — Telegram push notifications: `enabled()`, `send()`, one pure formatter per
-  event (`format_order`, `format_halt`, `format_startup_refused`, `format_config_refused`,
-  `format_liquidation_brake`) and the event entry points `bot.py` calls (`order_executed`, `halt`,
-  `startup_refused`, `config_refused`, `liquidation_brake`). Formatting and sending only — no trading
+  event (`format_order`, `format_halt`, `format_startup`, `format_startup_refused`,
+  `format_config_refused`, `format_liquidation_brake`) and the event entry points `bot.py` calls
+  (`order_executed`, `halt`, `startup`, `startup_refused`, `config_refused`, `liquidation_brake`). Formatting and sending only — no trading
   logic, no decisions. Every entry point returns a bool and swallows `Exception`, so a notification
   failure can never reach the loop; see architecture notes.
-- `futures/bot.py` — the polling loop (entry point). Owns the loop's mutable state across iterations:
+- `futures/bot.py` — the polling loop (entry point). Holds **`MODE`**, the `test`/`live` switch, as a
+  module constant at the top of the file. Owns the loop's mutable state across iterations:
   `active_index` (which zone is currently being worked), `halted` (whether the HALT-left-the-ladder
   notice has already been announced, and re-armed once price returns to the ladder), `refused_cfg` (the
   settings edit whose reload was last refused), a `LadderState` instance (the resting-order lifecycle
@@ -91,8 +97,9 @@ It may also define two optional names:
   or empty means notifications are simply off; that is a supported state, not an error, and it must
   stay silent rather than warn.
 
-Live and testnet credentials are entirely separate and not interchangeable; `client.build(testnet)`
-picks the pair to use based on the `testnet` flag in `settings.json`.
+Live and testnet credentials are entirely separate and not interchangeable; `client.build(mode)`
+picks the pair to use from `MODE` in `futures/bot.py` — **not** from `settings.json`, which no longer
+carries an exchange selector at all.
 
 The legacy `binance/` bot has its own separate, also-gitignored `binance/config.py` (`api_key`,
 `api_secret`, `slack_token`) — unrelated to `futures/config.py` and not needed to run the futures bot.
@@ -102,6 +109,13 @@ The legacy `binance/` bot has its own separate, also-gitignored `binance/config.
 ```
 python futures/bot.py
 ```
+
+**Which account it trades is `MODE` at the top of `futures/bot.py`** — `env.TEST` (Binance testnet)
+or `env.LIVE` (real money). New work is validated on `test` and only then promoted to `live`. Each
+mode reads its own `futures/<mode>/settings.json` and writes its own `futures/<mode>/logs/`. Changing
+it requires editing the file and restarting; it is not a runtime setting and cannot be hot-reloaded.
+Starting in `live` prints an unmissable banner and pushes a Telegram notice, but does **not** prompt —
+a crash-restart has to come back up unattended while a position is open.
 
 Run from a directory where `futures/` modules can be imported as top-level modules (e.g. `cd futures`
 and run `python bot.py`, or run with `futures/` on `PYTHONPATH`) — `futures/` is not a package and its
@@ -179,10 +193,12 @@ collection.
   carrying the changed fields as `{field: [old, new]}`). Under the throttle the next tick record can be
   up to a minute away, so without this the journal cannot say when an edit actually took effect. It is
   the counterpart to `config_refused`; keep both.
-- **Telegram notifications may never affect trading** (`futures/notify.py`). Six events are pushed:
+- **Telegram notifications may never affect trading** (`futures/notify.py`). Seven events are pushed:
   every executed order (never throttled — fills are rare and each moves real money, and this covers both
   a market-order fill and an individual ladder rung's fill — see `_journal_ladder_fill`), the transition
-  into `HALT`, `startup_refused`, `config_refused`, every loop `error` record the throttle lets through,
+  into `HALT`, `startup` (once per launch, naming the mode, sent *after* the startup checks pass and the
+  book is swept — a bot that refused to start has not started, and `startup_refused` already speaks for
+  that case), `startup_refused`, `config_refused`, every loop `error` record the throttle lets through,
   and the liquidation-cap brake engaging (`liquidation_brake`, pushed whenever the accumulate side is
   shrunk or cancelled outright — see the ladder lifecycle notes below). Three rules hold this together. (1) *It cannot
   raise into the loop*: `send()` and every event entry point swallow `Exception` and return a bool, and
@@ -304,7 +320,25 @@ collection.
   before any order exists, which is the recoverable outcome; double exposure on a leveraged account is
   not. It runs *after* the refusal guard: a position the bot refuses to adopt is somebody else's trade,
   and so are the orders working it.
-- **`settings.json` is re-read every tick** (`bot.py`'s loop calls `settings.load()` each iteration).
+- **The exchange selector is `MODE` in `bot.py`, never a setting** (`futures/env.py`). `settings.json`
+  is re-read every tick, so a selector living there could swap accounts underneath a bot holding a
+  leveraged position — which is why `bot.py` used to carry a whole guard refusing any reload that
+  changed `testnet`, and `notify.py` a message branch explaining the refusal. Both are now deleted:
+  `bot.py` is read once at import, so switching environments requires a restart as a matter of
+  physics rather than of policy. Three rules hold it together. (1) *`env.validate()` fails closed* —
+  every accessor routes through it, and an unrecognised mode raises at startup before a client
+  exists. The shape to never write is `mode == TEST`, letting anything else mean live: that resolves
+  a typo to the real-money account. (2) *`env.py` must not `import config`* — `config.py` is
+  gitignored, so a module that reaches for credentials cannot be imported on a fresh clone (the
+  breakage commit `7a6d4a0` had to fix in the notify tests). Credential selection lives in
+  `client.py`, which already imports `config`. (3) *The journals are separate* — `env.log_dir(mode)`
+  is threaded explicitly through `TickLog` and every `journal.log_*` call rather than installed by
+  reassigning `journal.LOG_DIR`, because `journal.py` must stay free of module-level mutable state.
+  `tests/conftest.py` therefore patches **both** `journal.LOG_DIR` and `env.log_dir`; dropping
+  either half lets a test write fabricated fills into a real journal. Do not reintroduce an exchange
+  field into `settings.json`, and do not let `settings.load()` regain a default path.
+- **`settings.json` is re-read every tick** (`bot.py`'s loop calls `settings.load(settings_file)` each
+  iteration, always the same mode's file).
   This lets trend, leverage, and the zone ladder change without restarting the bot. An invalid edit
   (caught as `ValueError`/`KeyError`/`OSError`) is logged to the tick journal as a `config_error` and
   otherwise ignored — the prior valid `Settings` stay in force. Never make a settings-load failure

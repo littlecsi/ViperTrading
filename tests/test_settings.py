@@ -19,7 +19,6 @@ def valid_data():
         "rebalance_threshold": 0.05,
         "stop_buffer": 0.01,
         "poll_seconds": 5,
-        "testnet": True,
         "rung_spacing_pct": 0.005,
         "liquidation_buffer_pct": 0.2,
         "zones": [
@@ -169,3 +168,32 @@ def test_loads_ladder_settings(tmp_path):
     s = settings.load(write(tmp_path, data))
     assert s.rung_spacing_pct == 0.005
     assert s.liquidation_buffer_pct == 0.2
+
+
+def test_settings_carry_no_exchange_selector(tmp_path):
+    """Which account is traded is env.MODE's answer, set in bot.py, and it must
+    not be reachable from this file. settings.json is re-read every tick, so a
+    selector here could swap exchanges under a bot holding a leveraged
+    position - the hazard bot.py used to carry a whole refusal guard to
+    prevent."""
+    s = settings.load(write(tmp_path, valid_data()))
+    assert not hasattr(s, "testnet")
+    assert not hasattr(s, "mode")
+
+
+def test_a_stray_testnet_key_is_ignored_not_honoured(tmp_path):
+    """An operator's old settings.json, or one copied between the two mode
+    folders, still carries "testnet". Loading must not fail on it - but it must
+    not mean anything either."""
+    data = valid_data()
+    data["testnet"] = False
+    s = settings.load(write(tmp_path, data))
+    assert not hasattr(s, "testnet")
+
+
+def test_load_requires_an_explicit_path():
+    """No default path. Each mode owns a settings.json under its own folder, so
+    a caller that passes nothing has not said which environment it means - and
+    the old futures/settings.json it would once have defaulted to is gone."""
+    with pytest.raises(TypeError):
+        settings.load()

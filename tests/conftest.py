@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "futures"))
 
 import pytest  # noqa: E402  (the path insert above has to come first)
 
+import env  # noqa: E402
 import journal  # noqa: E402
 import notify  # noqa: E402
 
@@ -14,17 +15,21 @@ def no_real_journal(monkeypatch, tmp_path):
     """No test may write to the operator's journal. Applies to the WHOLE suite.
 
     The counterpart to no_telegram, and it exists for the same reason: several
-    tests drive the real bot.run(), and the paths they drive call
-    journal.log_tick/log_order with no log_dir - which means the real
-    futures/logs/. A test that flattens a fabricated position was appending a
+    tests drive the real bot.run(), and the paths they drive journal whatever
+    they do. A test that flattens a fabricated position was appending a
     fabricated ORDER to the live order journal, which is both the audit trail
     for real money and the dataset a PPO policy is meant to train on. Neither
     can carry trades that never happened.
 
-    Redirecting the default is what makes this total: a test that never thinks
-    about logging still cannot reach the real directory, and one that passes an
-    explicit log_dir (tmp_path, as test_journal.py does) is unaffected."""
+    BOTH halves are needed, because there are now two ways to reach a journal
+    directory. journal.LOG_DIR covers callers that pass no log_dir at all.
+    env.log_dir covers bot.run(), which resolves its mode's directory once at
+    startup and passes it explicitly to every journal call from then on - so
+    patching journal.LOG_DIR alone would leave the entire loop writing into the
+    real futures/test/logs/. A test that passes its own log_dir (tmp_path, as
+    test_journal.py does) is unaffected by either."""
     monkeypatch.setattr(journal, "LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setattr(env, "log_dir", lambda mode: str(tmp_path / "logs"))
 
 
 @pytest.fixture(autouse=True)

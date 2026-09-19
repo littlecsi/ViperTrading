@@ -3,6 +3,7 @@ import traceback
 from dataclasses import asdict, fields, is_dataclass
 
 import client
+import env
 import execution
 import journal
 import ladder
@@ -10,6 +11,25 @@ import market
 import notify
 import settings
 import strategy
+
+# ---------------------------------------------------------------------------
+# WHICH ACCOUNT THIS PROCESS TRADES.
+#
+#   env.TEST - Binance futures testnet. Fake money, real order matching.
+#   env.LIVE - the live account. REAL MONEY.
+#
+# New strategy work is validated on TEST and only then promoted to LIVE. Each
+# mode has its own settings.json and its own journal under futures/<mode>/, so
+# the two never share risk parameters and testnet fills never land in the live
+# audit trail (which is also the dataset a PPO policy trains on).
+#
+# This deliberately lives in code rather than in settings.json. settings.json
+# is re-read every tick, so a selector there could swap exchanges underneath a
+# bot holding a leveraged position - a hazard this file used to carry an entire
+# refusal guard to prevent. bot.py is read once, at import, so switching now
+# requires a restart as a matter of physics rather than of policy.
+# ---------------------------------------------------------------------------
+MODE = env.TEST
 
 # A tick that repeats the state of the one before it is journalled at most this
 # often. At a one-second poll the unthrottled log wrote ~86400 lines (~35 MB) a
@@ -53,9 +73,15 @@ class TickLog:
     tick, so one shared log would see alternating keys, call every record a
     change from the last, and throttle none of them."""
 
-    def __init__(self, interval: float = TICK_LOG_INTERVAL_SECONDS, clock=time.monotonic):
+    def __init__(
+        self,
+        interval: float = TICK_LOG_INTERVAL_SECONDS,
+        clock=time.monotonic,
+        log_dir=None,
+    ):
         self._interval = interval
         self._clock = clock
+        self._log_dir = log_dir
         self._last_key = None
         self._last_at = None
 
@@ -78,7 +104,7 @@ class TickLog:
         # let a failed write (the journal file is opened every tick, and a
         # Windows file lock on it is the very hazard the loop's error handler
         # is built around) silence this state for the rest of the interval.
-        journal.log_tick(record)
+        journal.log_tick(record, self._log_dir)
         self._last_key = key
         self._last_at = now
         return True
@@ -135,7 +161,7 @@ def _config_changes(old, new) -> dict:
     }
 
 
-def _log_config_reloaded(cfg, changes: dict) -> None:
+def _log_config_reloaded(cfg, changes: dict, log_dir=None) -> None:
     """Record that an edited settings.json actually took effect.
 
     A successful reload used to be visible only as a console line, which was
@@ -151,7 +177,8 @@ def _log_config_reloaded(cfg, changes: dict) -> None:
             "trend": cfg.trend,
             "leverage": cfg.leverage,
             "changed": changes,
-        }
+        },
+        log_dir,
     )
 
 
@@ -191,7 +218,9 @@ def _liquidation_breached(trend, liquidation_price, survival_price) -> bool:
     return liquidation_price <= survival_price
 
 
-def _log_liquidation_brake(cfg, survival, liquidation_price, scale, source) -> None:
+def _log_liquidation_brake(
+    cfg, survival, liquidation_price, scale, source, log_dir=None
+) -> None:
     """Record the brake engaging, then push the SAME record to Telegram.
 
     Journal first and notify from what was written - the rule every other
@@ -220,7 +249,7 @@ def _log_liquidation_brake(cfg, survival, liquidation_price, scale, source) -> N
         "scale": scale,
         "cancelled": scale == 0.0,
     }
-    journal.log_tick(record)
+    journal.log_tick(record, log_dir)
     # notify.liquidation_brake takes the message's values as keywords rather
     # than a record, so the two journal-bookkeeping fields are dropped here -
     # the rest is passed through exactly as written.
@@ -416,7 +445,8 @@ def _detect_fill(api, cfg, ladder_state) -> tuple:
 
 
 def _journal_ladder_fill(
-    api, cfg, decision, price, wallet, order_id, rung_price, pending=None
+    api, cfg, decision, price, wallet, order_id, rung_price, pending=None,
+    log_dir=None,
 ) -> bool:
     """Journal and notify ONE rung that left the book, if it left by filling.
 
@@ -476,7 +506,8 @@ def _journal_ladder_fill(
         # under one throttled error message a minute.
         try:
             journal.log_tick(
-                {"action": "error", "error": f"ladder fill lookup failed: {_ascii(exc)}"}
+                {"action": "error", "error": f"ladder fill lookup failed: {_ascii(exc)}"},
+                log_dir,
             )
         except Exception:
             pass
@@ -500,7 +531,7 @@ def _journal_ladder_fill(
         "active_zone_index": decision.zone_index,
         "balance": wallet,
     }
-    journal.log_order(record)
+    journal.log_order(record, log_dir)
     if pending is None:
         notify.order_executed(record)
     else:
@@ -526,7 +557,9 @@ def _notify_ladder_fills(records) -> None:
         notify.order_executed(record)
 
 
-def _log_ladder_fills(api, cfg, decision, price, wallet, ladder_state, filled_ids) -> None:
+def _log_ladder_fills(
+    api, cfg, decision, price, wallet, ladder_state, filled_ids, log_dir=None
+) -> None:
     """Record every rung that filled, then push each record to Telegram.
 
     A ladder PLACEMENT is not a trade and deliberately reaches no order
@@ -572,7 +605,9 @@ def _log_ladder_fills(api, cfg, decision, price, wallet, ladder_state, filled_id
             (p for p, oid in ladder_state.orders.items() if oid == order_id),
             None,
         )
-        if _journal_ladder_fill(api, cfg, decision, price, wallet, order_id, rung_price):
+        if _journal_ladder_fill(
+            api, cfg, decision, price, wallet, order_id, rung_price, log_dir=log_dir
+        ):
             # Marked only where the exchange actually ANSWERED, so an id whose
             # lookup failed is left unmarked and gets a second attempt when the
             # reconcile pass prunes it. Marked on a CANCELED answer too: that is
@@ -583,7 +618,8 @@ def _log_ladder_fills(api, cfg, decision, price, wallet, ladder_state, filled_id
 
 
 def _reconcile_ladder(
-    api, cfg, decision, price, snapshot, filters, leverage_brackets, ladder_state
+    api, cfg, decision, price, snapshot, filters, leverage_brackets, ladder_state,
+    log_dir=None,
 ) -> None:
     """Rebuild the ladder around the position the fills actually left behind.
 
@@ -713,7 +749,7 @@ def _reconcile_ladder(
             else:
                 _journal_ladder_fill(
                     api, cfg, decision, price, snapshot.wallet_balance,
-                    order_id, rung_price, pending=fills,
+                    order_id, rung_price, pending=fills, log_dir=log_dir,
                 )
             # Pruned either way, including after a failed lookup: the id is off
             # the book and cannot come back, and keeping it would hand
@@ -754,7 +790,7 @@ def _reconcile_ladder(
     # Telegram gets in front of an order. Neither half can raise.
     if scale < 1.0:
         _log_liquidation_brake(
-            cfg, survival, snapshot.liquidation_price, scale, "reconcile"
+            cfg, survival, snapshot.liquidation_price, scale, "reconcile", log_dir
         )
 
     # The wait is over whether or not the diff had anything in it. Leaving the
@@ -792,9 +828,36 @@ def _sleep(seconds) -> None:
     time.sleep(delay)
 
 
+def _print_live_banner(cfg) -> None:
+    """Say, unmissably, that this process trades real money.
+
+    Printed before the client is built, so it is the first thing on the console
+    - an operator who started the wrong one has until the first tick to stop it.
+
+    ASCII only, like every other print() in this file: the console codepage is
+    cp949, this runs before the loop's error handling exists, and a
+    UnicodeEncodeError here would kill the bot at startup with nothing to catch
+    it. No prompt either, deliberately: a crash-restart has to come back up
+    unattended while a leveraged position is open, and a confirmation prompt
+    would block forever at exactly the wrong moment."""
+    print("=" * 60)
+    print("  V I P E R  --  L I V E  M O D E")
+    print("  REAL MONEY. Orders go to the live Binance account.")
+    print(f"  {cfg.symbol} @ {cfg.leverage}x  trend={cfg.trend}")
+    print("=" * 60)
+
+
 def run() -> None:
-    cfg = settings.load()
-    api = client.build(cfg.testnet)
+    # Before anything else, and before a client exists: an unrecognised MODE
+    # must end the process here rather than resolve to somebody's default.
+    mode = env.validate(MODE)
+    settings_file = env.settings_path(mode)
+    log_dir = env.log_dir(mode)
+
+    cfg = settings.load(settings_file)
+    if not env.is_testnet(mode):
+        _print_live_banner(cfg)
+    api = client.build(mode)
 
     market.set_leverage(api, cfg.symbol, cfg.leverage)
     margin_result = market.set_margin_type(api, cfg.symbol)
@@ -809,8 +872,10 @@ def run() -> None:
     filters = market.get_filters(api, cfg.symbol)
     leverage_brackets = market.get_leverage_brackets(api, cfg.symbol)
 
-    label = "TESTNET" if cfg.testnet else "LIVE"
+    label = env.label(mode)
     print(f"Viper starting on {label} - {cfg.symbol} @ {cfg.leverage}x, trend={cfg.trend}")
+    print(f"  settings: {settings_file}")
+    print(f"  journal:  {log_dir}")
 
     # Startup reconciliation guard. The sizing logic assumes it owns the whole
     # position on the configured symbol, so a pre-existing position that is
@@ -836,14 +901,14 @@ def run() -> None:
             "action": "startup_refused",
             "reason": "unreconciled_position",
             "symbol": cfg.symbol,
-            "testnet": cfg.testnet,
+            "mode": mode,
             "position_amt": start_amt,
             "current_notional": start_notional,
             "max_notional": start_max_n,
             "trend": cfg.trend,
             "wrong_side": wrong_side,
         }
-        journal.log_tick(refusal)
+        journal.log_tick(refusal, log_dir)
         # Notified from the same dict, and after the journal write: a Telegram
         # problem must never cost the record. notify cannot raise.
         notify.startup_refused(refusal)
@@ -873,15 +938,27 @@ def run() -> None:
     # the orders working it.
     execution.cancel_all_orders(api, cfg.symbol)
 
+    # Only now, with the startup checks passed and the book swept: a bot that
+    # refused to start has not started, and startup_refused already spoke for
+    # that case. Pushed in both modes - an operator who gets one of these
+    # unexpectedly has learned something worth knowing - and it cannot raise.
+    notify.startup(
+        mode=mode,
+        symbol=cfg.symbol,
+        leverage=cfg.leverage,
+        trend=cfg.trend,
+        max_notional=start_max_n,
+    )
+
     active_index = None
     halted = False
     ladder_state = LadderState()
     # One write policy per record stream. They must not share: the streams
     # interleave within a tick, so through a single log each record would look
     # like a change from the last one written and none of them would throttle.
-    tick_log = TickLog()
-    config_log = TickLog()
-    error_log = TickLog()
+    tick_log = TickLog(log_dir=log_dir)
+    config_log = TickLog(log_dir=log_dir)
+    error_log = TickLog(log_dir=log_dir)
     # The config whose reload was last refused. Refusals are re-evaluated every
     # tick (the operator may flatten, or edit the file again), but only
     # announced when the refused config changes, so a walked-away operator does
@@ -897,36 +974,15 @@ def run() -> None:
             # below as a config_error, which is the opposite of what happened.
             reloaded = None
             try:
-                new_cfg = settings.load()
+                # The same file every tick: which one was decided by MODE at
+                # startup. There is no longer a guard here refusing a reload
+                # that changes the exchange, because a reload cannot propose
+                # that change - the selector is a constant in this module, not
+                # a field in the file being re-read.
+                new_cfg = settings.load(settings_file)
                 if new_cfg != cfg:
                     announce = new_cfg != refused_cfg
-                    if new_cfg.testnet != cfg.testnet:
-                        # Nothing downstream re-reads cfg.testnet, and rebuilding
-                        # the client here would swap accounts underneath an open
-                        # position. Refuse the WHOLE reload: adopting the rest of
-                        # the file while silently ignoring a live/testnet switch
-                        # is how an operator "makes it safe" and walks away from a
-                        # bot still trading real money.
-                        refused_cfg = new_cfg
-                        if announce:
-                            print("*** SETTINGS RELOAD REFUSED ***")
-                            print(
-                                f"  'testnet' changed {cfg.testnet} -> {new_cfg.testnet}; "
-                                "switching between live and testnet requires a RESTART."
-                            )
-                            print(
-                                f"  The bot is STILL RUNNING on {label} with the previous "
-                                "settings. No part of the new file was applied."
-                            )
-                            refusal = {
-                                "action": "config_refused",
-                                "reason": "testnet_change_requires_restart",
-                                "current_testnet": cfg.testnet,
-                                "rejected_testnet": new_cfg.testnet,
-                            }
-                            journal.log_tick(refusal)
-                            notify.config_refused(refusal)
-                    elif new_cfg.symbol != cfg.symbol:
+                    if new_cfg.symbol != cfg.symbol:
                         # Adopting a new symbol while the old one holds a position
                         # orphans that position: nothing would stop it out, scale
                         # it out, or flatten it on a halt.
@@ -951,7 +1007,7 @@ def run() -> None:
                                     "rejected_symbol": new_cfg.symbol,
                                     "position_amt": old_amt,
                                 }
-                                journal.log_tick(refusal)
+                                journal.log_tick(refusal, log_dir)
                                 notify.config_refused(refusal)
                         else:
                             # Fetch into a temporary: if set_leverage below fails,
@@ -1025,11 +1081,12 @@ def run() -> None:
                         reloaded = changes
                 else:
                     # The file now matches what is running, so any earlier
-                    # refusal is spent. Without this, an operator who sets
-                    # testnet, reverts it, then sets it again gets NO message
-                    # and no journal line the second time - and that loud
-                    # message is the entire mitigation. A silent refusal reads
-                    # exactly like the hazard it exists to prevent.
+                    # refusal is spent. Without this, an operator who changes
+                    # the symbol under an open position, reverts it, then makes
+                    # the same edit again gets NO message and no journal line
+                    # the second time - and that loud message is the entire
+                    # mitigation. A silent refusal reads exactly like the
+                    # hazard it exists to prevent.
                     refused_cfg = None
             # TypeError belongs with the rest: a null or wrong-typed field
             # ("leverage": null) reaches int()/float() and raises it, and a
@@ -1049,7 +1106,7 @@ def run() -> None:
                 )
 
             if reloaded is not None:
-                _log_config_reloaded(cfg, reloaded)
+                _log_config_reloaded(cfg, reloaded, log_dir)
 
             # One read per endpoint for the whole tick: 11 request weight
             # instead of 21, and three instants instead of five. Three
@@ -1319,7 +1376,7 @@ def run() -> None:
                         if open_now == ladder_state.settling_snapshot:
                             _reconcile_ladder(
                                 api, cfg, decision, price, snapshot, filters,
-                                leverage_brackets, ladder_state,
+                                leverage_brackets, ladder_state, log_dir,
                             )
                         else:
                             ladder_state.settling_snapshot = open_now
@@ -1333,7 +1390,7 @@ def run() -> None:
                         # this branch deliberately sends none.
                         _log_ladder_fills(
                             api, cfg, decision, price, wallet, ladder_state,
-                            filled_ids,
+                            filled_ids, log_dir,
                         )
                         # A rung filled, so the ladder no longer matches the
                         # position - but this tick does NOTHING about it beyond
@@ -1441,7 +1498,7 @@ def run() -> None:
                                     del ladder_state.orders[rung_price]
                             _log_liquidation_brake(
                                 cfg, survival, snapshot.liquidation_price,
-                                0.0, "backstop",
+                                0.0, "backstop", log_dir,
                             )
 
                 _sleep(cfg.poll_seconds)
@@ -1506,7 +1563,10 @@ def run() -> None:
                     position_after = market.get_position_amt(api, cfg.symbol)
                 except Exception as exc:
                     position_after = None
-                    journal.log_tick({"action": "error", "error": f"position_after failed: {exc}"})
+                    journal.log_tick(
+                        {"action": "error", "error": f"position_after failed: {exc}"},
+                        log_dir,
+                    )
 
                 # Realised PnL has to be reconstructable from this record, so
                 # the fill is recorded as it happened rather than as it was
@@ -1548,7 +1608,7 @@ def run() -> None:
                     "available_balance": available,
                     "unrealized_pnl": pnl,
                 }
-                journal.log_order(record)
+                journal.log_order(record, log_dir)
                 print(f"{side} {qty} {cfg.symbol} @ ~{price} ({decision.reason})")
                 # Journal first, then Telegram, and from the same record: a
                 # notification problem can never cost an order-journal line.

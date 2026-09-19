@@ -7,7 +7,12 @@ config.py
 # Python
 __pycache__/
 *.pyc
+
+# Journals: one directory per mode (futures/test/logs, futures/live/logs).
+# The bare futures/logs/ is the pre-split location, kept so an existing
+# working tree's old journal stays ignored rather than turning up untracked.
 futures/logs/
+futures/*/logs/
 
 # Editor / OS
 .vscode

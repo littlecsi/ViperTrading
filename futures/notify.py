@@ -27,6 +27,8 @@ _redact has been over it.
 
 import requests
 
+import env
+
 try:
     # Optional on purpose: notifications are a convenience, so a config.py that
     # does not exist or does not import must leave the bot able to trade.
@@ -351,6 +353,37 @@ def format_loop_error(message, symbol=None) -> str:
     return "\n".join(lines)
 
 
+def _mode_label(mode) -> str:
+    """env.label, but it cannot raise.
+
+    env.label rejects an unrecognised mode, which is right at startup and wrong
+    here: this module's whole contract is that a notification failure never
+    reaches the loop, and a message is a poor place to discover a bad mode -
+    bot.py has already refused to start by then. An unknown value is shown
+    verbatim rather than guessed at, since silently printing LIVE for a mode
+    nobody recognised is the one wrong answer."""
+    try:
+        return env.label(mode)
+    except Exception:
+        return _safe_text(mode)
+
+
+def format_startup(mode, symbol, leverage, trend, max_notional) -> str:
+    """Message for a bot that has just come up and is about to trade.
+
+    Pushed in both modes - knowing a process started is useful either way, and
+    an operator who gets one of these unexpectedly has learned something
+    important. Only the live variant shouts."""
+    lines = [f"VIPER STARTED - {_mode_label(mode)}"]
+    if mode == env.LIVE:
+        lines.append("REAL MONEY. Orders go to the live account.")
+    lines += [
+        f"{_safe_text(symbol)} @ {_safe_text(leverage)}x  trend={_safe_text(trend)}",
+        f"max notional: {_num(max_notional)} USDT",
+    ]
+    return "\n".join(lines)
+
+
 def format_startup_refused(record: dict) -> str:
     """Message for a startup the bot declined, from its journal record."""
     problem = "opposes the trend" if record.get("wrong_side") else "exceeds the exposure cap"
@@ -362,7 +395,7 @@ def format_startup_refused(record: dict) -> str:
             f"position: {_trim(amt)} ({_num(record.get('current_notional'))} USDT)",
             f"trend: {record.get('trend', _UNKNOWN)}",
             f"this bot's cap: {_num(record.get('max_notional'))} USDT",
-            f"mode: {'TESTNET' if record.get('testnet') else 'LIVE'}",
+            f"mode: {_mode_label(record.get('mode'))}",
             "",
             "The bot is NOT running. Flatten or reconcile that",
             "position manually, then start it again.",
@@ -378,13 +411,10 @@ def format_config_refused(record: dict) -> str:
     reason = record.get("reason")
     lines = ["SETTINGS RELOAD REFUSED"]
 
-    if reason == "testnet_change_requires_restart":
-        current = record.get("current_testnet")
-        lines += [
-            f"'testnet' {current} -> {record.get('rejected_testnet')} needs a RESTART.",
-            f"Still running on {'TESTNET' if current else 'LIVE'} with the old settings.",
-        ]
-    elif reason == "symbol_change_with_open_position":
+    # There is no testnet_change_requires_restart branch any more: the exchange
+    # selector moved out of settings.json into env.MODE in bot.py, which is not
+    # hot-reloaded, so a reload can no longer propose that change at all.
+    if reason == "symbol_change_with_open_position":
         current = record.get("current_symbol", _UNKNOWN)
         lines += [
             f"'symbol' {current} -> {record.get('rejected_symbol')} "
@@ -451,6 +481,22 @@ def loop_error(message, symbol=None) -> bool:
     an identical repeat - a rejected order recurring every poll - collapses to
     one message a minute rather than one per poll."""
     return _notify(format_loop_error, message, symbol=symbol)
+
+
+def startup(mode, symbol, leverage, trend, max_notional) -> bool:
+    """Call once, after the startup checks pass and before the loop begins.
+
+    After them deliberately: a bot that refuses to start has not started, and
+    startup_refused is that event's message. Two pushes for one launch, one of
+    them wrong, is worse than a slightly later one."""
+    return _notify(
+        format_startup,
+        mode=mode,
+        symbol=symbol,
+        leverage=leverage,
+        trend=trend,
+        max_notional=max_notional,
+    )
 
 
 def startup_refused(record: dict) -> bool:

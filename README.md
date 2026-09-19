@@ -23,8 +23,9 @@ that sizes positions based on price proximity to operator-defined support/resist
   accumulate side; exits (stop-outs, halts) still use market orders for certainty of execution.
 - **JSONL audit trail** — records a tick-by-tick decision journal and a full order journal for
   after-the-fact analysis and future RL/PPO training.
-- **Live and testnet modes** — switches between separate live and testnet Binance credentials via a
-  config flag.
+- **Separate test and live modes** — a `MODE` constant in `futures/bot.py` selects the Binance
+  testnet or the live account. Each mode has its own settings file and its own journal, and the two
+  share one copy of the trading code, so behaviour cannot drift between them.
 
 ## Setup
 
@@ -43,10 +44,14 @@ that sizes positions based on price proximity to operator-defined support/resist
    Optionally add Telegram push notifications by also defining `telegram_token` and
    `telegram_chat_id`. Leaving both undefined or empty is a supported state — notifications simply
    stay off.
-3. Configure `futures/settings.json` — symbol, trend (`long`/`short`), leverage, alpha, exposure
-   fraction, rebalance threshold, stop buffer, poll interval, `testnet` flag, rung spacing, liquidation
-   buffer, and the ordered zone ladder (support/resistance pairs). This file is re-read every tick, so
-   most fields can be edited live without restarting the bot.
+3. Configure the settings file for the mode you intend to run — `futures/test/settings.json` or
+   `futures/live/settings.json`. Each holds symbol, trend (`long`/`short`), leverage, alpha, exposure
+   fraction, rebalance threshold, stop buffer, poll interval, rung spacing, liquidation buffer, and
+   the ordered zone ladder (support/resistance pairs). These files are re-read every tick, so every
+   field can be edited live without restarting the bot.
+
+   There is deliberately **no exchange selector in these files.** Which account is traded is `MODE`
+   in `futures/bot.py`, so a settings edit can never swap accounts underneath a running bot.
 
 ## Running
 
@@ -58,8 +63,27 @@ cd futures
 python bot.py
 ```
 
-Start with `"testnet": true` in `settings.json` and confirm correct behavior on Binance's testnet
-before ever switching to live trading.
+### Choosing the account
+
+Near the top of `futures/bot.py`:
+
+```python
+MODE = env.TEST   # Binance testnet - fake money, real order matching
+# MODE = env.LIVE # the live account - REAL MONEY
+```
+
+Leave it on `env.TEST` and confirm correct behaviour on Binance's testnet before ever switching to
+live trading. Switching requires editing this file and restarting — it is not a runtime setting, by
+design. Starting in `live` prints a large banner and pushes a Telegram notice; it does not prompt,
+so that an unattended restart is never left waiting for a keypress.
+
+To check credentials and connectivity without placing any orders:
+
+```
+cd futures
+python client.py         # testnet
+python client.py live    # the live account
+```
 
 To verify your setup, run the test suite:
 

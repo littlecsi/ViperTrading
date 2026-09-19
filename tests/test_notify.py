@@ -29,6 +29,11 @@ import test_tick_throttle as loop  # LoopClient/run_loop: the real bot.run()
 TOKEN = "1234567890:FAKE-TOKEN-FOR-TESTS"
 CHAT_ID = 999
 
+# bot.run() pushes one of these before the loop begins. The wiring tests below
+# are each about a single in-loop event, so the collectors filter it out by
+# this prefix; test_startup_notifies_once_before_the_loop is what covers it.
+STARTUP_PREFIX = "VIPER STARTED"
+
 # Korean for "connection failed", the shape of message a localised Windows
 # delivers to this machine. Built from code points so that this file itself
 # stays ASCII - the repository is checked for non-ASCII bytes.
@@ -73,7 +78,23 @@ def posts(monkeypatch):
 
 @pytest.fixture
 def sent(monkeypatch):
-    """Capture message text at the send() seam."""
+    """Capture message text at the send() seam.
+
+    The startup push is filtered out: bot.run() announces itself once before
+    the loop, and every test using this fixture is about something that happens
+    during the loop. test_startup_notifies_once_before_the_loop uses its own
+    unfiltered capture."""
+    texts = []
+    monkeypatch.setattr(
+        notify, "send",
+        lambda text: (texts.append(text) if not text.startswith(STARTUP_PREFIX) else None) or True,
+    )
+    return texts
+
+
+@pytest.fixture
+def all_sent(monkeypatch):
+    """Every message, startup push included."""
     texts = []
     monkeypatch.setattr(notify, "send", lambda text: texts.append(text) or True)
     return texts
@@ -290,7 +311,7 @@ def refusal_record(**overrides):
         "action": "startup_refused",
         "reason": "unreconciled_position",
         "symbol": "ETHUSDT",
-        "testnet": True,
+        "mode": "test",
         "position_amt": 8.559,
         "current_notional": 20497.12,
         "max_notional": 25000.0,
@@ -325,10 +346,10 @@ def all_messages():
         ),
         notify.format_loop_error("-2019 Margin is insufficient", symbol="ETHUSDT"),
         notify.format_startup_refused(refusal_record()),
-        notify.format_config_refused(
-            {"reason": "testnet_change_requires_restart", "current_testnet": True,
-             "rejected_testnet": False}
-        ),
+        notify.format_startup(mode="test", symbol="ETHUSDT", leverage=5, trend="long",
+                              max_notional=25000.0),
+        notify.format_startup(mode="live", symbol="ETHUSDT", leverage=5, trend="long",
+                              max_notional=25000.0),
         notify.format_config_refused(
             {"reason": "symbol_change_with_open_position", "current_symbol": "ETHUSDT",
              "rejected_symbol": "BTCUSDT", "position_amt": 8.559}
@@ -474,19 +495,42 @@ def test_startup_refused_message_distinguishes_the_two_reasons():
         refusal_record(wrong_side=True)
     )
     assert "is NOT running" in notify.format_startup_refused(refusal_record())
-    assert "LIVE" in notify.format_startup_refused(refusal_record(testnet=False))
+    assert "LIVE" in notify.format_startup_refused(refusal_record(mode="live"))
+    assert "TESTNET" in notify.format_startup_refused(refusal_record(mode="test"))
+
+
+def test_startup_message_names_the_mode_and_the_size_at_risk():
+    """The one push that arrives before anything has happened. It has to answer
+    the question the operator actually has - which account, and how big can
+    this get - not merely that a process came up."""
+    test = notify.format_startup(mode="test", symbol="ETHUSDT", leverage=5,
+                                 trend="long", max_notional=25000.0)
+    live = notify.format_startup(mode="live", symbol="ETHUSDT", leverage=5,
+                                 trend="long", max_notional=25000.0)
+
+    for text in (test, live):
+        assert "ETHUSDT" in text
+        assert "5x" in text
+        assert "long" in text
+        assert "25,000.00" in text  # _num's grouping, as every other message uses
+
+    assert "TESTNET" in test
+    assert "REAL MONEY" not in test
+
+    # The live one must be impossible to mistake for the test one at a glance
+    # on a phone lock screen.
+    assert "LIVE" in live
+    assert "REAL MONEY" in live
 
 
 def test_config_refused_message_says_nothing_was_applied():
-    for text in all_messages()[-2:]:
-        assert "REFUSED" in text
-        assert "NO part of the new settings file was applied." in text
+    text = all_messages()[-1]
+    assert "REFUSED" in text
+    assert "NO part of the new settings file was applied." in text
 
 
 def test_config_refused_names_the_rejected_edit():
-    testnet, symbol = all_messages()[-2:]
-    assert "'testnet' True -> False needs a RESTART." in testnet
-    assert "Still running on TESTNET" in testnet
+    symbol = all_messages()[-1]
     assert "'symbol' ETHUSDT -> BTCUSDT while ETHUSDT holds 8.559." in symbol
 
 
@@ -567,8 +611,29 @@ class Trimming(loop.LoopClient):
         return {**result, "avgPrice": "3400.00", "executedQty": "1.0", "cumQuote": "3400.00"}
 
 
+def kinds(events):
+    """Event kinds in order, minus the pre-loop startup push.
+
+    These tests assert what happened FIRST once the loop was running. The
+    startup announcement is sent before the loop begins, so counting it would
+    make every ordering assertion here read one event late."""
+    return [
+        kind for kind, text in events
+        if not (kind == "notify" and text.startswith(STARTUP_PREFIX))
+    ]
+
+
 def messages(events):
-    return [text for kind, text in events if kind == "notify"]
+    """Messages sent during a run, minus the startup push.
+
+    bot.run() announces itself once before the loop, so every wiring test below
+    would otherwise have to count an event it is not about. Dropped here rather
+    than at the send() seam so the startup message stays observable - see
+    test_startup_notifies_once_before_the_loop, which is what covers it."""
+    return [
+        text for kind, text in events
+        if kind == "notify" and not text.startswith(STARTUP_PREFIX)
+    ]
 
 
 def test_a_flatten_is_placed_before_anything_is_notified(monkeypatch, written, events):
@@ -578,7 +643,7 @@ def test_a_flatten_is_placed_before_anything_is_notified(monkeypatch, written, e
     api = Holding(events=events)
     drive(monkeypatch, api, ticks=2)
 
-    assert [kind for kind, _ in events][0] == "order"
+    assert kinds(events)[0] == "order"
     sent = messages(events)
     assert sent[0].startswith("ORDER FILLED")  # the receipt, never throttled
     assert sent[1].startswith("HALT - FLATTENED")  # the alarm, with the outcome
@@ -593,7 +658,7 @@ def test_a_failed_flatten_is_attempted_first_and_then_shouted_about(monkeypatch,
     api = Holding(events=events, order_error=lambda n: "-2019 Margin is insufficient")
     drive(monkeypatch, api, ticks=2)
 
-    assert [kind for kind, _ in events][0] == "order"
+    assert kinds(events)[0] == "order"
     assert api.orders == 2  # it kept trying after the failure
     sent = messages(events)
     assert sent[0].startswith("HALT - FLATTEN FAILED")
@@ -701,7 +766,7 @@ def drive(monkeypatch, api, ticks):
 
     loop.run_loop stubs out journal.log_order, which is the very thing two of
     these tests are about, so they drive the loop directly instead."""
-    monkeypatch.setattr(bot.client, "build", lambda testnet: api)
+    monkeypatch.setattr(bot.client, "build", lambda mode: api)
     polls = {"n": 0}
 
     def sleep(seconds):
@@ -744,6 +809,33 @@ def test_startup_refusal_notifies_and_the_bot_still_refuses(monkeypatch, written
     assert len(sent) == 1
     assert sent[0].startswith("STARTUP REFUSED")
     assert "opposes the trend" in sent[0]
+
+
+def test_startup_notifies_once_before_the_loop(monkeypatch, written, all_sent):
+    """One push per launch, naming the mode - and exactly one, not one a tick."""
+    api = loop.LoopClient(balance="1000.0")
+    loop.run_loop(monkeypatch, written, ticks=50, api=api)
+
+    startups = [t for t in all_sent if t.startswith(STARTUP_PREFIX)]
+    assert len(startups) == 1
+    assert "TESTNET" in startups[0]
+    assert "ETHUSDT" in startups[0]
+
+
+def test_a_refused_startup_does_not_also_announce_itself_as_started(
+    monkeypatch, written, all_sent
+):
+    """A bot that refused to start has not started. Two pushes for one launch,
+    one of them wrong, is worse than the refusal alone."""
+    api = loop.LoopClient(balance="1000.0")
+    monkeypatch.setattr(api, "get_position_risk", lambda symbol=None: [
+        {"symbol": "ETHUSDT", "positionAmt": "-5.0", "unRealizedProfit": "0.0",
+         "liquidationPrice": "0.0", "entryPrice": "0.0", "isolatedWallet": "0.0"}
+    ])
+    drive(monkeypatch, api, ticks=1)
+
+    assert not [t for t in all_sent if t.startswith(STARTUP_PREFIX)]
+    assert [t.split("\n")[0] for t in all_sent] == ["STARTUP REFUSED"]
 
 
 def test_format_liquidation_brake_reports_a_shrink():
