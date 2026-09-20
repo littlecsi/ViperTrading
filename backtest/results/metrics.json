@@ -1,0 +1,32 @@
+{
+  "A-configured": {
+    "label": "A-configured",
+    "final_equity": 6076.109239493733,
+    "return_pct": 21.522184789874665,
+    "excess_pct": 8.373964185262881,
+    "max_drawdown_pct": -23.723960477261098,
+    "orders": 264,
+    "closing_trades": 155,
+    "win_rate_pct": 76.7741935483871,
+    "realized": 1312.5552065797503,
+    "biggest_trade": 54.76972415134731,
+    "concentration_pct": 4.172755848804712,
+    "max_notional": 30048.128261997314,
+    "bars_in_zone_pct": 100.0
+  },
+  "B-walkforward": {
+    "label": "B-walkforward",
+    "final_equity": 7707.310918128646,
+    "return_pct": 54.14621836257292,
+    "excess_pct": 40.99799775796113,
+    "max_drawdown_pct": -37.009560334636056,
+    "orders": 345,
+    "closing_trades": 201,
+    "win_rate_pct": 73.6318407960199,
+    "realized": 2913.8708856743915,
+    "biggest_trade": 1124.5470636900175,
+    "concentration_pct": 38.59289267821317,
+    "max_notional": 33353.978307091995,
+    "bars_in_zone_pct": 77.27314814814815
+  }
+}

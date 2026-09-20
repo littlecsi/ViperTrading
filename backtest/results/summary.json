@@ -1,0 +1,37 @@
+{
+  "symbol": "ETHUSDT",
+  "window_start": 1787270400000,
+  "window_end": 1789862400000,
+  "bars": 43200,
+  "start_balance": 5000.0,
+  "buy_and_hold_pct": 13.148220604611783,
+  "first_price": 2325.79,
+  "last_price": 2631.59,
+  "runs": [
+    {
+      "label": "A-configured",
+      "orders": 264,
+      "realized": 1312.5552065797503,
+      "fees": 113.97397837980579,
+      "funding": 27.355570901552994,
+      "start_equity": 5000.0,
+      "final_equity": 6076.109239493733,
+      "return_pct": 21.522184789874665,
+      "max_notional": 30048.128261997314,
+      "rejected_orders": 63
+    },
+    {
+      "label": "B-walkforward",
+      "orders": 345,
+      "realized": 2913.87088567439,
+      "fees": 286.599063338281,
+      "funding": 8.739083457039387,
+      "start_equity": 5000.0,
+      "final_equity": 7707.310918128646,
+      "return_pct": 54.14621836257292,
+      "max_notional": 33353.978307091995,
+      "rejected_orders": 0
+    }
+  ],
+  "generated_at": "2026-09-20T03:35:39.019108+00:00"
+}

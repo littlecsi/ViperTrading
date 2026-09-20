@@ -28,3 +28,6 @@ skills-lock.json
 *.xlsx
 *.png
 *.pem
+
+# Backtest kline/funding cache (re-downloadable, ~40MB)
+backtest/data/
