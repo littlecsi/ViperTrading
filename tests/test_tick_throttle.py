@@ -34,6 +34,41 @@ def load_settings():
     return bot.settings.load(bot.env.settings_path(bot.MODE))
 
 
+def below_ladder() -> str:
+    """A price the configured ladder has definitively halted out of.
+
+    DERIVED from the ladder, never a literal. These tests used a hardcoded
+    1500, which meant "off the ladder" right up until the operator added a
+    support at 1411 - at which point 1500 sat INSIDE the new bottom zone and
+    eight HALT tests quietly started exercising in-zone behaviour instead,
+    while still passing their own names. A test suite for a trading bot must
+    not depend on whichever zones the operator happens to have configured
+    today.
+
+    10% below the HALT threshold, so it is unambiguously past the dead band
+    rather than resting on it."""
+    cfg = load_settings()
+    halt_at = min(z.support for z in cfg.zones) * (1 - cfg.stop_buffer)
+    return f"{halt_at * 0.9:.2f}"
+
+
+def in_zone_accumulating() -> str:
+    """A price inside the ladder where the strategy WANTS a position.
+
+    Not merely "inside": inside at a zone's FAVOURABLE edge. The distance term
+    d is measured toward the level the bot accumulates into - support when the
+    trend is long - so a price sitting at the other edge of the same zone
+    yields a target near zero and no order at all. A test that only needed
+    "back on the ladder" and took the midpoint got exactly that, and failed
+    asserting an order had been placed."""
+    cfg = load_settings()
+    top = cfg.zones[0]
+    span = top.resistance - top.support
+    if cfg.trend == bot.settings.LONG:
+        return f"{top.support + span * 0.12:.2f}"
+    return f"{top.resistance - span * 0.12:.2f}"
+
+
 class Clock:
     def __init__(self):
         self.t = 0.0
@@ -1337,7 +1372,7 @@ def test_a_fill_taken_out_by_a_halt_is_still_journalled(monkeypatch, written):
     api = LoopClient(
         price="2500.00", balance="1000.0", position="0.2",
         open_orders_after_tick={2: [i for i in all_ids if i != all_ids[0]]},
-        price_schedule={4: "1800.00"},  # price read 4 is loop tick 3
+        price_schedule={4: below_ladder()},  # price read 4 is loop tick 3
     )
     records = run_loop(monkeypatch, written, ticks=3, api=api, orders=order_journal)
 
@@ -1704,7 +1739,7 @@ def test_halt_cancels_the_resting_ladder_before_flattening(monkeypatch, written)
     is worthless if a BUY rung is still resting underneath it."""
     api = LoopClient(
         price="2500.00", balance="1000.0", position="0.2",
-        price_schedule={3: "1800.00"},
+        price_schedule={3: below_ladder()},
     )
     records = run_loop(monkeypatch, written, ticks=2, api=api)
 
@@ -1737,7 +1772,7 @@ def test_a_failing_cancel_never_gates_the_halt_flatten(monkeypatch, written):
 
     api = LoopClient(
         price="2500.00", balance="1000.0", position="0.2",
-        price_schedule={3: "1800.00"},
+        price_schedule={3: below_ladder()},
         cancel_error=lambda n: ClientError(429, -1003, "Too many requests", {}),
     )
     # Recorded into the same timeline as the exchange calls, which is the only

@@ -34,6 +34,13 @@ CHAT_ID = 999
 # this prefix; test_startup_notifies_once_before_the_loop is what covers it.
 STARTUP_PREFIX = "VIPER STARTED"
 
+# The below-ladder price these flatten/HALT tests run at, formatted the way
+# notify._num renders it. Derived from the configured ladder rather than
+# written out, for the same reason loop.below_ladder() is: a literal stops
+# being "off the ladder" the moment the operator adds a lower support.
+HALT_PRICE = float(loop.below_ladder())
+HALT_PRICE_TEXT = f"{HALT_PRICE:,.2f}"
+
 # Korean for "connection failed", the shape of message a localised Windows
 # delivers to this machine. Built from code points so that this file itself
 # stays ASCII - the repository is checked for non-ASCII bytes.
@@ -560,12 +567,13 @@ def events(monkeypatch):
 class Holding(loop.LoopClient):
     """A client that already holds a position, for the flatten paths.
 
-    1.0 ETH at 1500 is 1500 USDT against a 5000 cap, so the startup
-    reconciliation guard lets the bot start; 1500 is below the ladder, so the
-    first tick halts."""
+    Priced below the configured ladder (loop.below_ladder, derived rather than
+    hardcoded) so the first tick halts, while 1.0 ETH stays well inside the
+    exposure cap so the startup reconciliation guard lets the bot start."""
 
     def __init__(self, events=None, amt="1.0", order_error=None):
-        super().__init__(price="1500.00", balance="1000.0", order_error=order_error)
+        super().__init__(price=loop.below_ladder(), balance="1000.0",
+                         order_error=order_error)
         self.amt = amt
         self.events = [] if events is None else events
 
@@ -581,7 +589,8 @@ class Holding(loop.LoopClient):
         self.events.append(("order", params.get("side")))
         result = super().new_order(**params)
         self.amt = "0.0"
-        return {**result, "avgPrice": "1500.00", "executedQty": "1.0", "cumQuote": "1500.00"}
+        price = loop.below_ladder()
+        return {**result, "avgPrice": price, "executedQty": "1.0", "cumQuote": price}
 
 
 class Trimming(loop.LoopClient):
@@ -647,7 +656,7 @@ def test_a_flatten_is_placed_before_anything_is_notified(monkeypatch, written, e
     sent = messages(events)
     assert sent[0].startswith("ORDER FILLED")  # the receipt, never throttled
     assert sent[1].startswith("HALT - FLATTENED")  # the alarm, with the outcome
-    assert "SELL 1 at 1,500.00" in sent[1]
+    assert f"SELL 1 at {HALT_PRICE_TEXT}" in sent[1]
     assert "position: 1 -> 0" in sent[1]
     assert len(sent) == 2  # the halt does not repeat on the next tick
 
@@ -662,7 +671,7 @@ def test_a_failed_flatten_is_attempted_first_and_then_shouted_about(monkeypatch,
     assert api.orders == 2  # it kept trying after the failure
     sent = messages(events)
     assert sent[0].startswith("HALT - FLATTEN FAILED")
-    assert "still open: 1 (1,500.00 USDT)" in sent[0]
+    assert f"still open: 1 ({HALT_PRICE_TEXT} USDT)" in sent[0]
     assert "tried: SELL 1" in sent[0]
     assert "-2019 Margin is insufficient" in sent[0]
     # The generic loop-error push follows from the same exception, then the
@@ -722,12 +731,12 @@ def test_every_fill_notifies_exactly_once_never_throttled(monkeypatch, written, 
 
 def test_halt_notifies_on_the_transition_not_every_tick(monkeypatch, written, sent):
     """Once price leaves the ladder EVERY tick decides HALT. One message."""
-    api = loop.LoopClient(price="1500.00", balance="1000.0")
+    api = loop.LoopClient(price=loop.below_ladder(), balance="1000.0")
     loop.run_loop(monkeypatch, written, ticks=300, api=api)
 
     assert len(sent) == 1
     assert sent[0].startswith("HALT - price left the zone ladder")
-    assert "ETHUSDT at 1,500.00" in sent[0]
+    assert f"ETHUSDT at {HALT_PRICE_TEXT}" in sent[0]
 
 
 def test_a_second_departure_notifies_again(monkeypatch, written, sent):
@@ -740,7 +749,8 @@ def test_a_second_departure_notifies_again(monkeypatch, written, sent):
 
         def __init__(self):
             super().__init__(balance="1000.0")
-            self.prices = ["1500.00"] * 3 + ["2700.00"] * 3 + ["1500.00"] * 3
+            off, on = loop.below_ladder(), loop.in_zone_accumulating()
+            self.prices = [off] * 3 + [on] * 3 + [off] * 3
             self.reads = 0
 
         def ticker_price(self, symbol):
