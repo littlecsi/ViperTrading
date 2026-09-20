@@ -113,6 +113,7 @@ def build_multi(meta, windows):
         payload["windows"][name] = {
             "days": w["days"],
             "bars": w["bars"],
+            "conditional": w.get("conditional", False),
             "buy_and_hold_pct": bh,
             "first_price": w["first_price"],
             "last_price": w["last_price"],
@@ -180,6 +181,9 @@ h2{font-size:19px;font-weight:600;margin:0 0 4px;letter-spacing:-.01em}
 .grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:16px;margin-top:18px}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:15px 14px 10px}
 .card h3{font-size:14px;font-weight:600;margin:0 0 2px}
+.card.cond{border-color:var(--warn)}
+.flag{font-size:10px;letter-spacing:.05em;text-transform:uppercase;color:var(--warn);
+  font-weight:600;border:1px solid var(--warn);border-radius:4px;padding:1px 5px;margin-left:6px}
 .card .meta{font-size:12px;color:var(--ink-3);margin:0 0 12px}
 .row{display:flex;gap:14px;flex-wrap:wrap;font-size:12.5px;margin:2px 4px 10px;color:var(--ink-2)}
 .row b{font-weight:600}
@@ -216,7 +220,7 @@ ol.lim strong{color:var(--ink);font-weight:600}
 
   <section>
     <p class="eyebrow">Headline</p>
-    <h2>Three windows, same ladder</h2>
+    <h2>Four windows, same ladder</h2>
     <p class="note"><b>With&nbsp;1411</b> is the ladder as configured today.
       <b>Without&nbsp;1411</b> is the same ladder minus the newly added support &mdash; the control, which
       isolates what that one line did. <b>Walk-forward</b> re-derives its zones every 7&nbsp;days from the
@@ -260,6 +264,10 @@ ol.lim strong{color:var(--ink);font-weight:600}
       <li><strong>The configured zones were drawn with recent history visible.</strong> Over the longer
         windows that matters less, but it never becomes a forecast. Read walk-forward for that &mdash; and
         note what it did over a year.</li>
+      <li><strong>The July window was chosen because the long call was right from there.</strong>
+        That is selection bias, the same family as look-ahead: it measures execution GIVEN a correct
+        regime call, not the strategy end to end. Read it as "how well does the machinery work once
+        the direction is right", and note that nothing here picks the direction for you.</li>
       <li><strong>A stop that never triggers cannot be judged by the run where it never triggered.</strong>
         1411 looks good here because ETH bottomed at 1504. One path is not a distribution.</li>
       <li><strong>Survivorship of the configuration itself.</strong> These are the zones that happen to be
@@ -299,21 +307,34 @@ const rows = NAMES.map(n => {
   return {n, w, on:w.stats["With 1411"], off:w.stats["Without 1411"],
           wf:w.stats["Walk-forward"], h:w.buy_and_hold_pct};
 });
-const yr = rows[rows.length-1];
+/* The verdict anchors on the longest ROLLING window, not the last entry -
+   an operator-chosen window is a conditional result and must not headline. */
+const yr = rows.find(r => r.n === "1 year") || rows[rows.length-1];
+const jul = rows.find(r => r.w.conditional);
 const gain = yr.on.return_pct - yr.off.return_pct;
 document.getElementById("verdict").innerHTML =
-  "<p><strong>The 1411 support helped on this price path, and the reason is luck about where the low fell.</strong> " +
-  "Over "+yr.n+" ETH bottomed at "+yr.w.low_price.toFixed(0)+" &mdash; above 1411 but below the 1853 stop the old ladder had. " +
-  "The old ladder flattened near the low; the new one did not, and rode the recovery: " +
-  pct(yr.on.return_pct)+" against "+pct(yr.off.return_pct)+", a "+gain.toFixed(0)+" point difference.</p>" +
-  "<p>That is a stop that did not trigger, which always looks good until it does. Had price reached 1300 the "+
-  "new ladder would have carried the position "+(1853.74-1396.89).toFixed(0)+" USDT further down before halting. " +
-  "Note also the drawdowns: "+yr.on.max_drawdown_pct.toFixed(0)+"% with the new support, "+
-  yr.wf.max_drawdown_pct.toFixed(0)+"% for the honest walk-forward run, which ended "+pct(yr.wf.return_pct)+".</p>";/* ---------- per-window cards ---------- */
+  "<p><strong>Over a full year a ladder drawn without hindsight lost most of the account.</strong> " +
+  "Walk-forward returned "+pct(yr.wf.return_pct)+" with a "+yr.wf.max_drawdown_pct.toFixed(0)+
+  "% peak drawdown, while the configured ladder returned "+pct(yr.on.return_pct)+
+  ". That gap is not strategy quality, it is information: the configured zones were drawn knowing "+
+  "where the bottom fell.</p>" +
+  (jul ? "<p><strong>Over "+jul.n+", chosen because the long call was right from there, all three "+
+    "configurations beat holding</strong> &mdash; walk-forward "+pct(jul.wf.return_pct)+
+    " against "+pct(jul.h)+" for hold, at a "+jul.wf.max_drawdown_pct.toFixed(0)+"% drawdown. "+
+    "Read that as how the machinery performs once the direction is right, not as a forecast: "+
+    "nothing here picks the direction.</p>" : "") +
+  "<p>The 1411 support helped on this path &mdash; "+pct(yr.on.return_pct)+" against "+
+  pct(yr.off.return_pct)+" over the year, a "+gain.toFixed(0)+" point difference &mdash; but only "+
+  "because ETH bottomed at "+yr.w.low_price.toFixed(0)+", above 1411 and below the 1853 stop the old "+
+  "ladder had. That is a stop that failed to trigger, not a demonstrated improvement.</p>";
+
+/* ---------- per-window cards ---------- */
 document.getElementById("cards").innerHTML = rows.map(r => {
   const line = (lab,v,cls) => '<div><b>'+lab+'</b> <span class="mono '+cls+'">'+v+'</span></div>';
   const cls = v => v>=0?"pos":"neg";
-  return '<div class="card"><h3>'+r.n+'</h3><p class="meta mono">'+
+  return '<div class="card'+(r.w.conditional?' cond':'')+'"><h3>'+r.n+
+    (r.w.conditional?' <span class="flag">operator-chosen start</span>':'')+
+    '</h3><p class="meta mono">'+
     r.w.bars.toLocaleString()+" bars &middot; ETH "+r.w.first_price.toFixed(0)+" &rarr; "+r.w.last_price.toFixed(0)+
     " &middot; low "+r.w.low_price.toFixed(0)+'</p><div class="row">'+
     line("With 1411", pct(r.on.return_pct), cls(r.on.return_pct))+
@@ -382,7 +403,8 @@ function draw(svg, series, fmt, opts){
 function panels(hostId, pick, fmt, opts){
   const host = document.getElementById(hostId);
   host.innerHTML = NAMES.map(n =>
-    '<div class="card"><h3>'+n+'</h3><p class="meta">'+
+    '<div class="card'+(D.windows[n].conditional?' cond':'')+'"><h3>'+n+
+    (D.windows[n].conditional?' <span class="flag">chosen start</span>':'')+'</h3><p class="meta">'+
     (hostId==="eqcharts" ? "equity, USDT" : "drawdown from peak")+
     '</p><svg viewBox="0 0 420 210" role="img" aria-label="'+n+'"></svg></div>').join("");
   [...host.querySelectorAll("svg")].forEach((svg,i) => draw(svg, pick(D.windows[NAMES[i]]), fmt, opts));

@@ -21,9 +21,18 @@ START_BALANCE = 5_000.0
 # Every window the report covers, longest last. One month is the smoke test;
 # six months and a year are what say whether the strategy survives a change of
 # regime rather than one friendly tape.
-WINDOWS = (("1 month", 30), ("6 months", 180), ("1 year", 365))
+# Each entry is (name, spec). An int spec is "this many days back from the
+# window end"; a "YYYY-MM-DD" string pins an absolute start.
+#
+# The July window is the operator's own: it is where they say they would have
+# set trend=long. That makes it a CONDITIONAL result - how the machinery
+# performs given a correct regime call - and not a forecast, because the date
+# was chosen knowing the call was right. It is labelled as such in the report
+# rather than left to look like the others.
+WINDOWS = (("1 month", 30), ("6 months", 180), ("1 year", 365),
+           ("From 1 Jul 2026", "2026-07-01"))
 WARMUP_DAYS = 30          # trailing data run B derives its first zones from
-WINDOW_DAYS = max(days for _, days in WINDOWS)
+WINDOW_DAYS = max(d for _, d in WINDOWS if isinstance(d, int))
 
 # The exchange filters and margin brackets are properties of the symbol, and
 # a backtest must not depend on an account being reachable to re-run. Fetched
@@ -175,8 +184,14 @@ def main():
         print(f"  {z.support:>8.2f} - {z.resistance:<8.2f}")
 
     windows = {}
-    for name, days in WINDOWS:
-        start = end - days * 86_400_000
+    for name, spec in WINDOWS:
+        if isinstance(spec, int):
+            start = end - spec * 86_400_000
+            days = spec
+        else:
+            start = int(datetime.strptime(spec, "%Y-%m-%d")
+                        .replace(tzinfo=timezone.utc).timestamp() * 1000)
+            days = (end - start) // 86_400_000
         bars = [b for b in history if b["open_time"] >= start]
         funding = [f for f in all_funding if f["time"] >= start]
         slug = name.replace(" ", "")
@@ -210,6 +225,7 @@ def main():
 
         windows[name] = {
             "days": days, "start": start, "end": end, "bars": len(bars),
+            "conditional": not isinstance(spec, int),
             "buy_and_hold_pct": hold,
             "first_price": bars[0]["close"],
             "last_price": bars[-1]["close"],

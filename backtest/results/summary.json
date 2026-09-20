@@ -20,7 +20,7 @@
         1872.46
       ]
     ],
-    "generated_at": "2026-09-20T04:07:33.959900+00:00",
+    "generated_at": "2026-09-20T04:22:47.618122+00:00",
     "window_end": 1789862400000
   },
   "stats": {
@@ -163,6 +163,53 @@
         "concentration_pct": 0.0,
         "max_notional": 25385.95290641033,
         "bars_in_zone_pct": 89.15981735159818
+      }
+    },
+    "From 1 Jul 2026": {
+      "With 1411": {
+        "label": "With 1411",
+        "final_equity": 11408.464400719939,
+        "return_pct": 128.16928801439875,
+        "excess_pct": 60.85474870970148,
+        "max_drawdown_pct": -41.769429725728024,
+        "orders": 575,
+        "closing_trades": 357,
+        "win_rate_pct": 84.87394957983193,
+        "realized": 7069.655713340211,
+        "biggest_trade": 2350.2520814805375,
+        "concentration_pct": 33.24422258704463,
+        "max_notional": 56420.2430181525,
+        "bars_in_zone_pct": 100.0
+      },
+      "Without 1411": {
+        "label": "Without 1411",
+        "final_equity": 9257.391825600067,
+        "return_pct": 85.14783651200135,
+        "excess_pct": 17.833297207304085,
+        "max_drawdown_pct": -42.59568188433698,
+        "orders": 1059,
+        "closing_trades": 597,
+        "win_rate_pct": 69.84924623115577,
+        "realized": 4846.714956675301,
+        "biggest_trade": 1907.0492901436191,
+        "concentration_pct": 39.34725493846242,
+        "max_notional": 45782.06354668956,
+        "bars_in_zone_pct": 77.05675582990398
+      },
+      "Walk-forward": {
+        "label": "Walk-forward",
+        "final_equity": 10983.017394457484,
+        "return_pct": 119.66034788914968,
+        "excess_pct": 52.34580858445241,
+        "max_drawdown_pct": -21.23367689024588,
+        "orders": 1012,
+        "closing_trades": 599,
+        "win_rate_pct": 77.79632721202003,
+        "realized": 6976.078147789863,
+        "biggest_trade": 821.9547859677593,
+        "concentration_pct": 11.782476752043959,
+        "max_notional": 51907.59345680656,
+        "bars_in_zone_pct": 88.82115912208505
       }
     }
   }
