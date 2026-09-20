@@ -1,37 +1,169 @@
 {
-  "symbol": "ETHUSDT",
-  "window_start": 1787270400000,
-  "window_end": 1789862400000,
-  "bars": 43200,
-  "start_balance": 5000.0,
-  "buy_and_hold_pct": 13.148220604611783,
-  "first_price": 2325.79,
-  "last_price": 2631.59,
-  "runs": [
-    {
-      "label": "A-configured",
-      "orders": 264,
-      "realized": 1312.5552065797503,
-      "fees": 113.97397837980579,
-      "funding": 27.355570901552994,
-      "start_equity": 5000.0,
-      "final_equity": 6076.109239493733,
-      "return_pct": 21.522184789874665,
-      "max_notional": 30048.128261997314,
-      "rejected_orders": 63
+  "meta": {
+    "symbol": "ETHUSDT",
+    "start_balance": 5000.0,
+    "zones": [
+      [
+        2625.0,
+        3284.04
+      ],
+      [
+        2371.26,
+        2625.0
+      ],
+      [
+        1872.46,
+        2371.26
+      ],
+      [
+        1411.0,
+        1872.46
+      ]
+    ],
+    "generated_at": "2026-09-20T04:07:33.959900+00:00",
+    "window_end": 1789862400000
+  },
+  "stats": {
+    "1 month": {
+      "With 1411": {
+        "label": "With 1411",
+        "final_equity": 6076.109239493733,
+        "return_pct": 21.522184789874665,
+        "excess_pct": 8.373964185262881,
+        "max_drawdown_pct": -23.723960477261098,
+        "orders": 264,
+        "closing_trades": 155,
+        "win_rate_pct": 76.7741935483871,
+        "realized": 1312.5552065797503,
+        "biggest_trade": 54.76972415134731,
+        "concentration_pct": 4.172755848804712,
+        "max_notional": 30048.128261997314,
+        "bars_in_zone_pct": 100.0
+      },
+      "Without 1411": {
+        "label": "Without 1411",
+        "final_equity": 6076.109239493733,
+        "return_pct": 21.522184789874665,
+        "excess_pct": 8.373964185262881,
+        "max_drawdown_pct": -23.723960477261098,
+        "orders": 264,
+        "closing_trades": 155,
+        "win_rate_pct": 76.7741935483871,
+        "realized": 1312.5552065797503,
+        "biggest_trade": 54.76972415134731,
+        "concentration_pct": 4.172755848804712,
+        "max_notional": 30048.128261997314,
+        "bars_in_zone_pct": 100.0
+      },
+      "Walk-forward": {
+        "label": "Walk-forward",
+        "final_equity": 6171.705289890929,
+        "return_pct": 23.43410579781857,
+        "excess_pct": 10.285885193206788,
+        "max_drawdown_pct": -21.854773377712316,
+        "orders": 332,
+        "closing_trades": 191,
+        "win_rate_pct": 84.81675392670157,
+        "realized": 1455.152038614074,
+        "biggest_trade": 317.4664477420417,
+        "concentration_pct": 21.816720130798515,
+        "max_notional": 29445.92959920473,
+        "bars_in_zone_pct": 77.27314814814815
+      }
     },
-    {
-      "label": "B-walkforward",
-      "orders": 345,
-      "realized": 2913.87088567439,
-      "fees": 286.599063338281,
-      "funding": 8.739083457039387,
-      "start_equity": 5000.0,
-      "final_equity": 7707.310918128646,
-      "return_pct": 54.14621836257292,
-      "max_notional": 33353.978307091995,
-      "rejected_orders": 0
+    "6 months": {
+      "With 1411": {
+        "label": "With 1411",
+        "final_equity": 5440.231767017135,
+        "return_pct": 8.804635340342703,
+        "excess_pct": -13.37724530947646,
+        "max_drawdown_pct": -78.10691363382443,
+        "orders": 1316,
+        "closing_trades": 753,
+        "win_rate_pct": 65.86985391766268,
+        "realized": 985.4558015135916,
+        "biggest_trade": 1120.771134756871,
+        "concentration_pct": 113.73124325164503,
+        "max_notional": 28475.897425632636,
+        "bars_in_zone_pct": 100.0
+      },
+      "Without 1411": {
+        "label": "Without 1411",
+        "final_equity": 4556.229151103813,
+        "return_pct": -8.875416977923745,
+        "excess_pct": -31.05729762774291,
+        "max_drawdown_pct": -78.1446891811712,
+        "orders": 1559,
+        "closing_trades": 852,
+        "win_rate_pct": 64.08450704225352,
+        "realized": 59.967977932378474,
+        "biggest_trade": 938.5150683095628,
+        "concentration_pct": 1565.027037209522,
+        "max_notional": 28475.897425632636,
+        "bars_in_zone_pct": 74.30516975308642
+      },
+      "Walk-forward": {
+        "label": "Walk-forward",
+        "final_equity": 9023.880179627318,
+        "return_pct": 80.47760359254636,
+        "excess_pct": 58.295722942727195,
+        "max_drawdown_pct": -64.90743083031661,
+        "orders": 2824,
+        "closing_trades": 1625,
+        "win_rate_pct": 67.26153846153846,
+        "realized": 6049.903564436221,
+        "biggest_trade": 519.367452684721,
+        "concentration_pct": 8.584722833232794,
+        "max_notional": 45719.550187732566,
+        "bars_in_zone_pct": 88.45023148148148
+      }
+    },
+    "1 year": {
+      "With 1411": {
+        "label": "With 1411",
+        "final_equity": 10752.62241316833,
+        "return_pct": 115.05244826336663,
+        "excess_pct": 156.1397274461611,
+        "max_drawdown_pct": -79.65432772905675,
+        "orders": 3109,
+        "closing_trades": 1770,
+        "win_rate_pct": 68.8135593220339,
+        "realized": 7331.236521860669,
+        "biggest_trade": 2214.8860104149944,
+        "concentration_pct": 30.21162942718503,
+        "max_notional": 56279.483795637934,
+        "bars_in_zone_pct": 83.88070776255708
+      },
+      "Without 1411": {
+        "label": "Without 1411",
+        "final_equity": 6471.385472878377,
+        "return_pct": 29.42770945756754,
+        "excess_pct": 70.51498864036199,
+        "max_drawdown_pct": -84.74002869935069,
+        "orders": 3196,
+        "closing_trades": 1757,
+        "win_rate_pct": 67.67216846898121,
+        "realized": 2604.3636739831163,
+        "biggest_trade": 1603.3099175597283,
+        "concentration_pct": 61.56244358560049,
+        "max_notional": 46689.821844361744,
+        "bars_in_zone_pct": 70.7435312024353
+      },
+      "Walk-forward": {
+        "label": "Walk-forward",
+        "final_equity": 1637.6642505349205,
+        "return_pct": -67.2467149893016,
+        "excess_pct": -26.159435806507148,
+        "max_drawdown_pct": -92.57500912887528,
+        "orders": 6956,
+        "closing_trades": 3967,
+        "win_rate_pct": 68.74212251071339,
+        "realized": -2320.470305314899,
+        "biggest_trade": 264.0443945366672,
+        "concentration_pct": 0.0,
+        "max_notional": 25385.95290641033,
+        "bars_in_zone_pct": 89.15981735159818
+      }
     }
-  ],
-  "generated_at": "2026-09-20T03:35:39.019108+00:00"
+  }
 }

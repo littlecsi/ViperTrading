@@ -18,7 +18,12 @@ import settings
 RESULTS = Path(__file__).resolve().parent / "results"
 SYMBOL = "ETHUSDT"
 START_BALANCE = 5_000.0
-WINDOW_DAYS = 30
+# Every window the report covers, longest last. One month is the smoke test;
+# six months and a year are what say whether the strategy survives a change of
+# regime rather than one friendly tape.
+WINDOWS = (("1 month", 30), ("6 months", 180), ("1 year", 365))
+WARMUP_DAYS = 30          # trailing data run B derives its first zones from
+WINDOW_DAYS = max(days for _, days in WINDOWS)
 
 # The exchange filters and margin brackets are properties of the symbol, and
 # a backtest must not depend on an account being reachable to re-run. Fetched
@@ -138,71 +143,93 @@ def _window_end() -> int:
 
 
 def main():
-    now = _window_end()
-    start = now - WINDOW_DAYS * 86_400_000
-    warmup_start = start - WINDOW_DAYS * 86_400_000
+    end = _window_end()
+    earliest = end - (WINDOW_DAYS + WARMUP_DAYS) * 86_400_000
 
-    print(f"window : {datetime.fromtimestamp(start/1000, timezone.utc)} -> "
-          f"{datetime.fromtimestamp(now/1000, timezone.utc)}")
-
-    bars = data.fetch_klines(SYMBOL, start, now)
-    funding = data.fetch_funding(SYMBOL, start, now)
-    warmup = data.fetch_klines(SYMBOL, warmup_start, start)
-    history = warmup + bars
+    # ONE fetch covering the longest span plus warmup; every window slices from
+    # it. Fetching per window would re-download the overlap three times over -
+    # a year of one-minute bars is 525,600 of them.
+    print(f"fetching {WINDOW_DAYS + WARMUP_DAYS} days of 1m bars "
+          f"(ending {datetime.fromtimestamp(end/1000, timezone.utc):%Y-%m-%d})...")
+    history = data.fetch_klines(SYMBOL, earliest, end)
+    all_funding = data.fetch_funding(SYMBOL, earliest, end)
     filters, brackets = _meta()
-    print(f"bars   : {len(bars)}   funding: {len(funding)}   warmup: {len(warmup)}")
+    print(f"  {len(history):,} bars, {len(all_funding)} funding events")
 
     configured = settings.load(env.settings_path(env.TEST))
-    buy_hold = (bars[-1]["close"] / bars[0]["close"] - 1) * 100
 
-    summaries = []
+    # The control: the same ladder without the newly added 1411 support. Adding
+    # a support does not only add a zone - it moves where past_adverse_end
+    # decides the thesis is dead, so it is a change to the STOP, not just to
+    # the sizing curve. Running both is the only way to say what it bought.
+    without_1411 = settings.Settings(**{
+        **configured.__dict__,
+        "zones": tuple(z for z in configured.zones if z.support != 1411.0),
+    })
 
-    print("\n--- A: configured zones (contains look-ahead) ---")
+    halt_new = min(z.support for z in configured.zones) * (1 - configured.stop_buffer)
+    halt_old = min(z.support for z in without_1411.zones) * (1 - configured.stop_buffer)
+    print(f"\nHALT threshold  with 1411: {halt_new:,.2f}   without: {halt_old:,.2f}")
+    print("\nzone ladder under test:")
     for z in configured.zones:
-        print(f"  zone {z.support:.2f} - {z.resistance:.2f}")
-    sim_a = engine.Simulator(configured, filters, brackets, START_BALANCE)
-    result_a = sim_a.run(bars, funding)
-    _write_jsonl(RESULTS / "A-configured-ticks.jsonl", result_a.ticks)
-    _write_jsonl(RESULTS / "A-configured-orders.jsonl", result_a.orders)
-    _write_jsonl(RESULTS / "A-configured-equity.jsonl", result_a.equity)
-    summaries.append(summarise("A-configured", result_a, sim_a.rejected))
+        print(f"  {z.support:>8.2f} - {z.resistance:<8.2f}")
 
-    print("\n--- B: walk-forward zones (no look-ahead) ---")
-    result_b = walk_forward("B-walkforward", configured, bars, funding,
-                            filters, brackets, history)
-    summaries.append(summarise("B-walkforward", result_b, 0))
-    print(f"  zone sets derived: {len(result_b.derivations)}")
+    windows = {}
+    for name, days in WINDOWS:
+        start = end - days * 86_400_000
+        bars = [b for b in history if b["open_time"] >= start]
+        funding = [f for f in all_funding if f["time"] >= start]
+        slug = name.replace(" ", "")
+        print(f"\n=== {name} ({len(bars):,} bars) ===")
 
-    for s in summaries:
-        print(f"\n{s['label']}")
-        print(f"  orders     : {s['orders']}")
-        print(f"  realized   : {s['realized']:+,.2f}")
-        print(f"  fees       : {s['fees']:,.2f}")
-        print(f"  funding    : {s['funding']:+,.2f}")
-        print(f"  max notional: {s['max_notional']:,.2f}")
-        print(f"  final eq   : {s['final_equity']:,.2f}  ({s['return_pct']:+.2f}%)")
+        runs = {}
+        for label, cfg in (("With 1411", configured), ("Without 1411", without_1411)):
+            sim = engine.Simulator(cfg, filters, brackets, START_BALANCE)
+            res = sim.run(bars, funding)
+            _write_jsonl(RESULTS / f"{slug}-{label.replace(' ','')}-ticks.jsonl", res.ticks)
+            _write_jsonl(RESULTS / f"{slug}-{label.replace(' ','')}-orders.jsonl", res.orders)
+            runs[label] = {"equity": res.equity, "orders": res.orders, "_r": res}
+
+        res_b = walk_forward(f"{slug}-walkforward", configured, bars, funding,
+                             filters, brackets, history)
+        runs["Walk-forward"] = {"equity": res_b.equity, "orders": res_b.orders, "_r": res_b}
+
+        hold = (bars[-1]["close"] / bars[0]["close"] - 1) * 100
+        for label, r in runs.items():
+            res = r["_r"]
+            final = res.equity[-1]["equity"]
+            low = min(e["equity"] for e in res.equity)
+            print(f"  {label:14}: {final:>10,.2f}  ({(final/START_BALANCE-1)*100:+8.2f}%)  "
+                  f"low {low:>9,.2f}  fills {len(res.orders):>5}  "
+                  f"fees {res.account.fees:>9,.2f}")
+        print(f"  {'hold':14}: {hold:+8.2f}%   ETH {bars[0]['close']:.0f} -> {bars[-1]['close']:.0f}"
+              f"  (low {min(b['low'] for b in bars):.0f})")
+
+        for r in runs.values():
+            r.pop("_r")
+
+        windows[name] = {
+            "days": days, "start": start, "end": end, "bars": len(bars),
+            "buy_and_hold_pct": hold,
+            "first_price": bars[0]["close"],
+            "last_price": bars[-1]["close"],
+            "low_price": min(b["low"] for b in bars),
+            "zone_sets": len(res_b.derivations),
+            "runs": runs,
+        }
 
     meta = {
         "symbol": SYMBOL,
-        "window_start": start,
-        "window_end": now,
-        "bars": len(bars),
         "start_balance": START_BALANCE,
-        "buy_and_hold_pct": buy_hold,
-        "first_price": bars[0]["close"],
-        "last_price": bars[-1]["close"],
-        "runs": summaries,
+        "zones": [[z.support, z.resistance] for z in configured.zones],
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "window_end": end,
     }
-    (RESULTS / "summary.json").write_text(json.dumps(meta, indent=2))
-
-    stats, path = report_mod.build(meta, {
-        "A-configured": {"equity": result_a.equity, "orders": result_a.orders},
-        "B-walkforward": {"equity": result_b.equity, "orders": result_b.orders},
-    })
-    print(f"report: {path}")
-    print(f"\nbuy and hold: {buy_hold:+.2f}%")
-    return meta
+    stats, path = report_mod.build_multi(meta, windows)
+    (RESULTS / "summary.json").write_text(json.dumps(
+        {"meta": meta, "stats": stats}, indent=2))
+    print(f"\nreport: {path}")
+    return stats
 
 
 if __name__ == "__main__":
