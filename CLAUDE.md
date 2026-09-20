@@ -41,6 +41,7 @@ The active system lives in `futures/`:
   tick size), `get_open_orders()` (polled every tick a ladder is live, to detect fills by diffing
   against tracked rung ids), `get_leverage_brackets()` (the maintenance-margin bracket table, fetched
   once at startup/symbol-switch and turned into a `MarginTier` by `maintenance_tier_from()`),
+  `get_account_trades()` (this account's own fills, **startup only** - see the recovery note),
   `set_leverage()`, and `set_margin_type()` (best-effort switch to ISOLATED margin, tolerating both
   "already set" and "position already open" as non-fatal).
 - `futures/strategy.py` — pure decision logic. `decide()` takes plain values and returns a `Decision`;
@@ -52,13 +53,20 @@ The active system lives in `futures/`:
   order-book diff that minimizes churn on reconciliation (`plan_orders`). No I/O, no client, no clock,
   for the same reason `strategy.py` has none — see architecture notes and
   `docs/superpowers/specs/2026-09-17-limit-order-ladder-design.md` for the full derivation.
+- `futures/recovery.py` — pure startup fill recovery: `anchor_ms` (how far back to look,
+  or `None` to look at all), `records_for` (exchange trades + already-known order ids ->
+  order-journal records). No I/O, no client, no clock, for the same reason `strategy.py`
+  and `ladder.py` have none. See architecture notes.
 - `futures/execution.py` — quantity flooring to the lot step, exchange filter checks, market- and
   limit-order placement (`place_limit_order`), side-aware price rounding to the tick size (`price_for`),
   and order cancellation/lookup (`cancel_orders`, `cancel_all_orders`, `query_order_result`).
 - `futures/journal.py` — two JSONL logs under `futures/<mode>/logs/` (gitignored): `ticks-YYYY-MM-DD.jsonl`
   (one line per record the loop hands it — a repeated state is written at most once per interval, see
   architecture notes below; `journal.py` writes, it does not decide) and `orders-YYYY-MM-DD.jsonl` (one
-  line per executed order, carrying a full environment snapshot at fill time).
+  line per executed order, carrying a full environment snapshot at fill time). It also
+  READS: `last_order_time()`, `last_tick_time()` and `known_order_ids()` are what startup
+  fill recovery anchors and dedupes against, so the journal stays its own memory rather
+  than growing a second state file beside it.
 - `futures/notify.py` — Telegram push notifications: `enabled()`, `send()`, one pure formatter per
   event (`format_order`, `format_halt`, `format_startup`, `format_startup_refused`,
   `format_config_refused`, `format_liquidation_brake`) and the event entry points `bot.py` calls
@@ -308,6 +316,45 @@ collection.
   and querying them after the flatten has gone out, across every exit call site, and no exit call site
   may grow a pre-order round-trip to do it. Do not add a "quick" fix that queries fills before an exit —
   that reintroduces the exact latency the exit path exists to avoid.
+- **A fill that completes while the bot is not running is recovered at startup**
+  (`futures/recovery.py`, `bot._recover_fills`, `journal`'s read path). Resting rungs
+  OUTLIVE the process: an order left on the book when the bot stops can fill hours later
+  with nothing watching — observed on 2026-09-19, where a rung filled six hours after the
+  process died. Nothing catches it afterwards. `_detect_fill` is poll-based and its
+  rung→id map died with the process; the startup sweep finds nothing to cancel because
+  the order already filled; the reconciliation guard then ADOPTS the resulting position,
+  leaving the order journal showing a position that appeared from nowhere. That journal
+  is the audit trail for real money and the dataset a PPO policy trains on, and this is a
+  hole neither use can even detect. `_recover_fills` runs once, AFTER the reconciliation
+  guard (a bot that refused to start has adopted nothing and must journal nothing) and
+  after the sweep, and is **non-fatal** — a failure writes an `error` tick record and the
+  loop starts anyway, because bookkeeping about the past is never a reason not to trade
+  in the present. Four rules hold it together. (1) *The anchor never outruns evidence the
+  bot was running*: `recovery.anchor_ms` takes the last order-journal fill time, else the
+  last tick-journal timestamp, else **`None`, and nothing is recovered at all** — a fresh
+  install on an account with prior history must not adopt that history as its own.
+  (2) *The anchor only ever reaches FURTHER back* (`recovery.SAFETY_MARGIN_MS`, with
+  `MAX_LOOKBACK_DAYS` capping the other end). A live order row is stamped when it was
+  JOURNALLED, up to a poll after the fill it describes, so anchoring exactly there can
+  step over a second fill inside that gap; over-reaching costs nothing because
+  `known_ids` drops anything already recorded, while under-reaching loses a row
+  permanently. That asymmetry decides every judgement call here — prefer silence to
+  invention. (3) *Dedup comes from the journal itself* (`journal.known_order_ids`), never
+  a separate last-id file, which could be lost, restored stale, or simply disagree with
+  the journal — each ending in a duplicated row or a skipped fill. This is the only
+  reason `journal.py` has a read path, and why its readers skip damaged lines instead of
+  raising: the journals they read were last written by a process that was killed, so a
+  truncated final line is the normal shape of the input, not an exception. (4) *Recovered
+  rows admit what they cannot know*: `reason`, `rung_price`, `mark_price`,
+  `active_zone_index`, `trend`, `leverage` and `balance` are all `null` and `recovered`
+  is `true`, because the bot was not running and writing startup-time values into those
+  fields would dress a guess as a fact. They are present-but-null so the row keeps the
+  same SHAPE as a live one. Recovered rows DO carry `commission`, which live rows leave
+  null — recovery is already reading `userTrades`, which the tick body deliberately never
+  calls. `market.get_account_trades` is weight 5 and runs **once, at startup**; do not
+  move it into the tick body, whose budget above assumes it is not there. This does NOT
+  close the separate same-poll-as-an-exit gap documented below, which is about the exit
+  path and stays open deliberately.
 - **`run()` sweeps the symbol once at startup, before the loop** (`execution.cancel_all_orders`, right
   after the startup reconciliation guard). The rung→id map lives in memory and dies with the process,
   so after any restart — deploy, crash, reboot — the previous run's rungs are still resting and this

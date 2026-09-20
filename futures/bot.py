@@ -1,6 +1,7 @@
 import time
 import traceback
 from dataclasses import asdict, fields, is_dataclass
+from datetime import datetime, timezone
 
 import client
 import env
@@ -9,6 +10,7 @@ import journal
 import ladder
 import market
 import notify
+import recovery
 import settings
 import strategy
 
@@ -828,6 +830,63 @@ def _sleep(seconds) -> None:
     time.sleep(delay)
 
 
+def _recover_fills(api, cfg, log_dir) -> int:
+    """Journal any fill that happened while this bot was not running to see it.
+
+    The hole being filled: _detect_fill is poll-based, so a rung that fills
+    between the last poll and the process ending is never noticed. The
+    rung->id map dies with the process, the reconciliation guard then simply
+    ADOPTS the resulting position on the next start, and the order journal is
+    left showing a position with no record of how it was acquired. That
+    journal is the audit trail for real money and the dataset a PPO policy
+    trains on; neither tolerates a hole it cannot even detect.
+
+    Runs once, at startup, after the reconciliation guard has passed - a bot
+    that refuses to start has adopted nothing and must journal nothing.
+
+    NON-FATAL by construction. Everything here is bookkeeping about the past;
+    none of it is a reason a bot cannot trade in the present. A failure is
+    written to the tick journal as an error and the loop starts anyway, which
+    is the same bargain every other non-trading failure in this file makes.
+
+    Returns how many records were written, for the console line."""
+    try:
+        since = recovery.anchor_ms(
+            journal.last_order_time(log_dir),
+            journal.last_tick_time(log_dir),
+            now_ms=int(time.time() * 1000),
+        )
+        if since is None:
+            # No order journal and no tick journal: no evidence this bot has
+            # ever run here, so every trade on the account is somebody else's.
+            return 0
+
+        trades = market.get_account_trades(api, cfg.symbol, since)
+        records = recovery.records_for(
+            trades,
+            known_ids=journal.known_order_ids(log_dir, since_ms=since),
+            recovered_at=datetime.now(timezone.utc).isoformat(),
+        )
+        for record in records:
+            # Journalled but deliberately NOT pushed to Telegram. These fills
+            # are hours old; an "ORDER FILLED" alert reads as one happening
+            # now, and a restart after a busy outage would fire a burst of
+            # them. The console line below is the right channel for history.
+            journal.log_order(record, log_dir)
+        return len(records)
+    except Exception as exc:
+        try:
+            journal.log_tick(
+                {"action": "error", "error": f"fill recovery failed: {_ascii(exc)}"},
+                log_dir,
+            )
+        except Exception:
+            pass
+        print(f"WARNING: fill recovery failed: {_ascii(exc)}")
+        print("  Starting anyway. The order journal may be missing recent fills.")
+        return 0
+
+
 def _print_live_banner(cfg) -> None:
     """Say, unmissably, that this process trades real money.
 
@@ -937,6 +996,10 @@ def run() -> None:
     # a position the bot refuses to adopt is somebody else's trade, and so are
     # the orders working it.
     execution.cancel_all_orders(api, cfg.symbol)
+
+    recovered = _recover_fills(api, cfg, log_dir)
+    if recovered:
+        print(f"Recovered {recovered} fill(s) that completed while the bot was down.")
 
     # Only now, with the startup checks passed and the book swept: a bot that
     # refused to start has not started, and startup_refused already spoke for

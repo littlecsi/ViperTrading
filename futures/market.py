@@ -231,6 +231,20 @@ def get_open_orders(client, symbol: str) -> list[dict]:
     return client.get_orders(symbol=symbol)
 
 
+def get_account_trades(client, symbol: str, start_ms: int, limit: int = 1000) -> list[dict]:
+    """This account's own fills on `symbol` at or after `start_ms`.
+
+    Called ONCE, at startup, by the fill-recovery pass -- never from the tick
+    body. The per-tick budget in CLAUDE.md is deliberate and this must not
+    enter it: `GET /fapi/v1/userTrades` is weight 5, and paying that every
+    second would move a ~12-weight tick to ~17 for a reconciliation that is
+    only ever needed after a restart.
+
+    Returns TRADES, not orders. One order can fill as several of them at
+    several prices, so the caller aggregates -- see recovery._aggregate."""
+    return client.get_account_trades(symbol=symbol, startTime=int(start_ms), limit=limit)
+
+
 def get_leverage_brackets(client, symbol: str) -> list[dict]:
     """The maintenance-margin bracket table for `symbol`. Fetched once at
     startup/symbol-switch and cached by bot.py -- this table changes rarely,

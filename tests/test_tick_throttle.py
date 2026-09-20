@@ -12,6 +12,10 @@ the timestamp/key bookkeeping under test is the code bot.py runs, not a
 re-implementation of it.
 """
 
+import json
+import time as time_module
+from datetime import datetime, timezone
+
 import pytest
 
 import bot
@@ -229,7 +233,8 @@ class LoopClient:
     def __init__(self, price="2700.00", balance="0.0", order_error=None, margin_type_error=None,
                  price_schedule=None, position="0.0", cancel_error=None,
                  open_orders_after_tick=None, entry_price="0.0",
-                 isolated_wallet="0.0", liquidation_price="0.0"):
+                 isolated_wallet="0.0", liquidation_price="0.0",
+                 trades=None, trades_error=None):
         self.price = price
         # {ticker_price call number: new price}. bot.run() has no supported
         # pause/resume, so walking price across a zone boundary inside ONE
@@ -251,6 +256,11 @@ class LoopClient:
         self.cancel_error = cancel_error
         self.margin_type_error = margin_type_error
         self.orders = 0
+        # What get_account_trades reports, for the startup fill-recovery
+        # pass. Empty is the normal case: nothing filled unseen.
+        self.trades = trades or []
+        self.trades_error = trades_error
+        self.trades_calls = 0
         self.placed_orders = []
         # Every LIMIT order this client accepted and has not since taken off
         # the book, as the exchange would report them. {loop tick: [ids that
@@ -272,6 +282,13 @@ class LoopClient:
         self._cancelled_ids = set()
         self.events = []  # ("place", type) / ("cancel", symbol), in call order
         self.margin_type_calls = []
+
+    def get_account_trades(self, symbol, startTime=None, limit=None):
+        self.trades_calls += 1
+        if self.trades_error:
+            raise RuntimeError(self.trades_error)
+        return [t for t in self.trades
+                if startTime is None or t["time"] >= startTime]
 
     def exchange_info(self):
         return {
@@ -1843,3 +1860,130 @@ def test_a_failed_cancel_is_retried_rather_than_stranding_the_old_rungs(monkeypa
     # Tried on the tick it failed, and again on the next one until it took.
     assert api.cancelled == ["ETHUSDT", "ETHUSDT"]
     assert len(ladder_order_ids(api)) > len(first)  # and the new zone's ladder went on
+
+
+# --- startup fill recovery: the wiring ------------------------------------
+#
+# recovery.py is tested exhaustively on its own. These drive the real bot.run()
+# instead, because a correct recovery module wired to the wrong place - or not
+# wired at all - would pass every one of those tests.
+
+
+def seed_journal(tmp_path, filename, records):
+    """Put real files on disk where env.log_dir points.
+
+    conftest redirects env.log_dir to tmp_path/logs so no test can touch the
+    operator's journal, and run_loop patches log_tick/log_order away to lists -
+    so nothing a test does reaches disk by itself. Recovery's anchor is read
+    FROM disk, so a test that wants one has to write it."""
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / filename).write_text(
+        "".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    return logs
+
+
+def a_trade(order_id=555, qty="0.458", price="2625", time_ms=None, trade_id=1):
+    at = time_ms if time_ms is not None else int(time_module.time() * 1000) - 60_000
+    return {
+        "symbol": "ETHUSDT", "id": trade_id, "orderId": order_id, "side": "BUY",
+        "price": price, "qty": qty,
+        "quoteQty": str(round(float(qty) * float(price), 8)),
+        "commission": "0.24045", "commissionAsset": "USDT", "realizedPnl": "0",
+        "time": at, "maker": True,
+    }
+
+
+def test_a_fill_completed_while_the_bot_was_down_is_journalled_at_startup(
+    monkeypatch, written, tmp_path
+):
+    """The whole point. The exchange knows about a fill; the journal does not;
+    one startup makes the journal agree with the exchange."""
+    # The bot was provably alive a moment ago - this is the cold-start anchor.
+    seed_journal(tmp_path, "ticks-2026-09-19.jsonl",
+                 [{"timestamp": datetime.now(timezone.utc).isoformat(), "action": "hold"}])
+
+    api = LoopClient(balance="1000.0", trades=[a_trade()])
+    orders = []
+    run_loop(monkeypatch, written, ticks=2, api=api, orders=orders)
+
+    recovered = [r for r in orders if r.get("recovered")]
+    assert len(recovered) == 1
+    assert recovered[0]["order_id"] == 555
+    assert recovered[0]["fill_price"] == pytest.approx(2625.0)
+    assert recovered[0]["commission"] == pytest.approx(0.24045)
+    # It must not pretend to know the decision behind a fill it never saw.
+    assert recovered[0]["reason"] is None
+
+
+def test_a_fill_already_in_the_journal_is_not_recovered_twice(
+    monkeypatch, written, tmp_path
+):
+    """Recovery runs on EVERY startup. A restart loop must not multiply rows."""
+    now_ms = int(time_module.time() * 1000)
+    seed_journal(tmp_path, "ticks-2026-09-19.jsonl",
+                 [{"timestamp": datetime.now(timezone.utc).isoformat(), "action": "hold"}])
+    seed_journal(tmp_path, "orders-2026-09-19.jsonl",
+                 [{"timestamp": datetime.now(timezone.utc).isoformat(),
+                   "order_id": 555, "fill_time": now_ms - 60_000}])
+
+    api = LoopClient(balance="1000.0", trades=[a_trade(order_id=555, time_ms=now_ms - 60_000)])
+    orders = []
+    run_loop(monkeypatch, written, ticks=2, api=api, orders=orders)
+
+    assert [r for r in orders if r.get("recovered")] == []
+
+
+def test_nothing_is_recovered_with_no_journal_at_all(monkeypatch, written, tmp_path):
+    """A fresh install on an account with history. With no evidence this bot
+    ever ran, every trade on it belongs to somebody else."""
+    api = LoopClient(balance="1000.0", trades=[a_trade(order_id=999)])
+    orders = []
+    run_loop(monkeypatch, written, ticks=2, api=api, orders=orders)
+
+    assert [r for r in orders if r.get("recovered")] == []
+    assert api.trades_calls == 0, "with no anchor it must not even ask the exchange"
+
+
+def test_recovery_failure_does_not_stop_the_bot(monkeypatch, written, tmp_path):
+    """Recovery is bookkeeping about the past. It is never a reason a bot
+    cannot trade in the present."""
+    seed_journal(tmp_path, "ticks-2026-09-19.jsonl",
+                 [{"timestamp": datetime.now(timezone.utc).isoformat(), "action": "hold"}])
+
+    api = LoopClient(balance="1000.0", trades_error="-1121 Invalid symbol")
+    orders = []
+    run_loop(monkeypatch, written, ticks=3, api=api, orders=orders)
+
+    # The loop ran regardless...
+    assert [r for r in written if r.get("action") not in ("error",)], "the loop must still tick"
+    # ...and the failure is on the record rather than swallowed silently.
+    errors = [r for r in written
+              if r.get("action") == "error" and "fill recovery failed" in str(r.get("error"))]
+    assert len(errors) == 1
+
+
+def test_a_refused_startup_recovers_nothing(monkeypatch, written, tmp_path):
+    """A bot that refuses to adopt a position has adopted nothing, so it has
+    nothing to account for. The orders working that position are somebody
+    else's too."""
+    seed_journal(tmp_path, "ticks-2026-09-19.jsonl",
+                 [{"timestamp": datetime.now(timezone.utc).isoformat(), "action": "hold"}])
+
+    api = LoopClient(balance="1000.0", trades=[a_trade()])
+    monkeypatch.setattr(api, "get_position_risk", lambda symbol=None: [
+        {"symbol": "ETHUSDT", "positionAmt": "-5.0", "unRealizedProfit": "0.0",
+         "liquidationPrice": "0.0", "entryPrice": "0.0", "isolatedWallet": "0.0"}
+    ])
+    orders = []
+    # Driven directly rather than through run_loop: run() returns at the
+    # refusal without ever reaching the loop, so run_loop's "it polled N
+    # times" assertion cannot hold by construction.
+    monkeypatch.setattr(bot.client, "build", lambda mode: api)
+    monkeypatch.setattr(
+        journal, "log_order", lambda record, log_dir=None: orders.append(record))
+    bot.run()
+
+    assert [r["action"] for r in written] == ["startup_refused"]
+    assert orders == []
+    assert api.trades_calls == 0
