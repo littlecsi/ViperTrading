@@ -31,3 +31,9 @@ skills-lock.json
 
 # Backtest kline/funding cache (re-downloadable, ~40MB)
 backtest/data/
+
+# Backtest raw output streams (regenerable by backtest/run.py, ~1.4GB).
+# The small summaries beside them - metrics.json, summary.json, report.html -
+# ARE tracked: they are what a reader needs to see a run's result without
+# re-running it, and they stay small.
+backtest/results/*.jsonl
